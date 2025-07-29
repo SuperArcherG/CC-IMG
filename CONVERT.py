@@ -1,19 +1,10 @@
 from PIL import Image
-import sys
-import os
-import math
-import numpy as np
-import torch
-import time
-import cv2
-import ffmpeg
-import json
-import subprocess
+import sys, os, math, torch, time, cv2, ffmpeg, json, subprocess, numpy as np, re, shutil
 
-aspect = (3,3)
-targetFPS = 20
-scale = 0.5
-total_res = (math.floor(188.5 / scale) * aspect[0], math.floor(126 / scale) * aspect[1])
+
+import cProfile
+
+# total_res = (math.floor(188.5 / scale) * aspect[0], math.floor(126 / scale) * aspect[1])
 
 cc_palette = {
     1:    (255, 255, 255),  # white
@@ -42,25 +33,7 @@ if not torch.cuda.is_available():
 cc_palette_keys = torch.tensor(list(cc_palette.keys()))
 cc_palette_colors = torch.tensor(list(cc_palette.values()), dtype=torch.float32) 
 
-
-def get_fps(path):
-    cmd = [
-        'ffprobe', '-v', 'error',
-        '-select_streams', 'v:0',
-        '-show_entries', 'stream=r_frame_rate',
-        '-of', 'json',
-        path
-    ]
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffprobe error: {result.stderr}")
-    
-    info = json.loads(result.stdout)
-    r_frame_rate = info['streams'][0]['r_frame_rate']  # like '30000/1001'
-    num, den = map(int, r_frame_rate.split('/'))
-    return num / den
-
-def get_closest_cc_matrix_torch(image_array):
+def closest_cc(image_array):
 
     img_tensor = torch.from_numpy(image_array).float().to(device).half()
 
@@ -70,20 +43,12 @@ def get_closest_cc_matrix_torch(image_array):
 
     palette = cc_palette_colors.to(device).half()
 
-    diffs = pixels.unsqueeze(1) - palette.unsqueeze(0)  
-
     dists = torch.cdist(pixels, palette)
     nearest_idxs = torch.argmin(dists, dim=1)
 
     keys = cc_palette_keys.to(nearest_idxs.device)[nearest_idxs].to("cpu")
 
     return keys.view(H, W).numpy()
-
-def closest_cc_color(rgb):
-    r, g, b = rgb
-    closest = min(cc_palette.items(),
-                  key=lambda kv: (kv[1][0]-r)**2 + (kv[1][1]-g)**2 + (kv[1][2]-b)**2)
-    return closest[0]
 
 def is_image_file(filepath):
     exclude_formats = ["GIF"]
@@ -103,12 +68,9 @@ def is_gif(filepath):
     except Exception:
         return False
 
-def is_video_file(filepath):
-    video_extensions = [".mp4", ".avi", ".mov", ".mkv"]
-    ext = os.path.splitext(filepath)[1].lower()
-    return ext in video_extensions
 
-def gif_to_frames(input_path):
+
+def gif_to_frames(input_path,total_res):
     output_dir = "TMP"
     os.makedirs(output_dir, exist_ok=True)
 
@@ -124,10 +86,36 @@ def gif_to_frames(input_path):
             if frame.mode != "RGB":
                 frame = frame.convert("RGB")
             frame_path = os.path.join(output_dir, f"frame_{frame_number:03}_{duration:2}.ccframe")
-            convert_image_to_bmp(img = frame,output_path=frame_path)
+            convert_image_to_ccframe(img = frame,output_path=frame_path,total_res=total_res)
             print(f"Processing frame {frame_number + 1} / {frame_count}", end='\r', flush=True)
 
-def convert_image_to_bmp(input_path="", img = None, output_path=""):
+hex_map = {
+    1:    "0",  # white
+    2:    "1",  # orange
+    4:    "2",  # magenta
+    8:    "3",  # lightBlue
+    16:   "4",  # yellow
+    32:   "5",  # lime
+    64:   "6",  # pink
+    128:  "7",  # gray
+    256:  "8",  # lightGray
+    512:  "9",  # cyan
+    1024: "a",  # purple
+    2048: "b",  # blue
+    4096: "c",  # brown
+    8192: "d",  # green
+    16384:"e",  # red
+    32768:"f",  # black
+}
+
+# Makes a lookup table for every possible color
+
+lookup = np.full(32769, ord("f"), dtype=np.uint8)  
+for k, v in hex_map.items(): 
+    lookup[k] = ord(v)
+
+
+def convert_image_to_ccframe(input_path="", img = None, output_path="", total_res=(-1,-1)):
     ccname = ""
     if img == None:
         print(input_path)
@@ -160,31 +148,12 @@ def convert_image_to_bmp(input_path="", img = None, output_path=""):
 
 
     np_img = np.array(img)
-    cc_matrix = get_closest_cc_matrix_torch(np_img)
+    cc_matrix = closest_cc(np_img)
 
     lua_lines = ["return {"]
 
-    hex_map = {
-        1:    "0",  # white
-        2:    "1",  # orange
-        4:    "2",  # magenta
-        8:    "3",  # lightBlue
-        16:   "4",  # yellow
-        32:   "5",  # lime
-        64:   "6",  # pink
-        128:  "7",  # gray
-        256:  "8",  # lightGray
-        512:  "9",  # cyan
-        1024: "a",  # purple
-        2048: "b",  # blue
-        4096: "c",  # brown
-        8192: "d",  # green
-        16384:"e",  # red
-        32768:"f",  # black
-    }
-
     for row in cc_matrix:
-        bg_line = "".join(hex_map.get(px, "f") for px in row)
+        bg_line = bytes(lookup[row]).decode("ascii")
         text_line = " " * len(bg_line)
         text_color_line = "0" * len(bg_line)
         lua_lines.append(f'  {{"{text_line}", "{text_color_line}", "{bg_line}"}},')
@@ -194,15 +163,36 @@ def convert_image_to_bmp(input_path="", img = None, output_path=""):
     with open(ccname, "w") as f:
         f.write("\n".join(lua_lines))
 
-
-def mp4_to_frames(input_path):
-    output_dir = "TMP"
+def is_video_file(filepath):
+    video_extensions = [".mp4", ".avi", ".mov", ".mkv"]
+    ext = os.path.splitext(filepath)[1].lower()
+    return ext in video_extensions
+def get_fps(path):
+    cmd = [
+        'ffprobe', '-v', 'error',
+        '-select_streams', 'v:0',
+        '-show_entries', 'stream=r_frame_rate',
+        '-of', 'json',
+        path
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffprobe error: {result.stderr}")
+    
+    info = json.loads(result.stdout)
+    r_frame_rate = info['streams'][0]['r_frame_rate']  # like '30000/1001'
+    num, den = map(int, r_frame_rate.split('/'))
+    return num / den
+def mp4_to_frames(input_path,targetFPS,total_res):
+    output_dir = re.sub(r'[^a-zA-Z0-9]', '', os.path.basename(input_path).split('.')[0]).upper()
+    print("Working Dir",output_dir)
+    if os.path.exists(output_dir) and os.path.isdir(output_dir):
+        shutil.rmtree(output_dir)
     os.makedirs(output_dir, exist_ok=True)
 
     current_fps = get_fps(input_path)
-    print(f"Input FPS: {current_fps}")
     if current_fps > targetFPS:
-        print(f"Resampling to a lower FPS")
+        print(f"Resampling {current_fps} to {targetFPS} FPS")
         (
             ffmpeg
             .input(input_path)
@@ -212,6 +202,8 @@ def mp4_to_frames(input_path):
             .run(overwrite_output=True)
         )
         input_path = output_dir + "\\TMP.mp4"
+    else:
+        print(f"Video at {targetFPS} FPS already")
 
     cap = cv2.VideoCapture(input_path)
     frame_number = 0
@@ -220,7 +212,6 @@ def mp4_to_frames(input_path):
         return
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    print(f"Total frames: {total_frames}")
 
     while True:
         ret, frame = cap.read()
@@ -232,7 +223,7 @@ def mp4_to_frames(input_path):
         pil_img = Image.fromarray(frame_rgb)
 
         frame_path = os.path.join(output_dir, f"frame_{frame_number:03}.ccframe")
-        convert_image_to_bmp(img=pil_img, output_path=frame_path)
+        convert_image_to_ccframe(img=pil_img, total_res=total_res, output_path=frame_path,)
         print(f"Processing frame {frame_number + 1} / {total_frames}", end='\r', flush=True)
 
         frame_number += 1
@@ -242,32 +233,55 @@ def mp4_to_frames(input_path):
         if os.path.exists(input_path):
             os.remove(input_path)
 
-def main(input_path):
+
+def get_folder_size(path):
+    total_size = 0
+    for dirpath, dirnames, filenames in os.walk(path):
+        for f in filenames:
+            fp = os.path.join(dirpath, f)
+            if os.path.exists(fp):  # Ensure file still exists
+                total_size += os.path.getsize(fp)
+    return total_size
+def main(input_path,totalMonitors,aspect,scale,targetFPS):
+    total_res = (math.floor((round(21.33266129032258 * (totalMonitors[0]/aspect[0]) - 6.645161290322656)*aspect[0])/(scale*2)), math.floor((round(14.222324046920821 * (totalMonitors[1]/aspect[1]) - 4.449596774193615)*aspect[1])/(scale*2)))
+    print("In game resolution to match:", total_res)
+
     start = time.time()
     if is_image_file(input_path):
-        convert_image_to_bmp(input_path)
+        convert_image_to_ccframe(input_path,total_res)
     elif is_gif(input_path):
-        gif_to_frames(input_path)
+        gif_to_frames(input_path,total_res)
     elif is_video_file(input_path):
-        mp4_to_frames(input_path)
+        mp4_to_frames(input_path,targetFPS,total_res)
     else:
         print("Unsupported file type.")
     end = time.time()
     print(f"Elapsed time: {end - start:.2f} seconds")
 
-
+    output_dir = re.sub(r'[^a-zA-Z0-9]', '', os.path.basename(input_path).split('.')[0]).upper()
+    print(f"Final size: {get_folder_size(output_dir)/ (1024 * 1024):.2f} MB")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python convert.py <image_file> [output.bmp]")
-        sys.exit(1)
+    with cProfile.Profile() as pr:
+        if len(sys.argv) < 7:
+            print("Usage: python convert.py <media_file (Any* Image / GIF / mp4, avi, mov, mkv)> <Block Width> <Block Height> <Cell # X> <Cell # Y> <Text Scale> <FPS <= 20 (Optional)>")
+            sys.exit(1)
 
-    input_file = sys.argv[1]
-    output_file = sys.argv[2] if len(sys.argv) > 2 else ""
+        input_file = sys.argv[1]
+        totalMonitors = (int(sys.argv[2]),int(sys.argv[3]))
+        aspect = (int(sys.argv[4]),int(sys.argv[5]))
+        scale = float(sys.argv[6])
 
-    if not os.path.exists(input_file):
-        print(f"Error: file not found: {input_file}")
-        sys.exit(1)
+        if len(sys.argv) > 7:
+            if float(sys.argv[7]) > 20:
+                print("\033[91mREQUESTED FPS TOO HIGH, SETTING TO 20\033[0m")
+            targetFPS = min(float(sys.argv[7]),20)
+        else:
+            targetFPS = 20
 
-    main(input_file)
+        if not os.path.exists(input_file):
+            print(f"Error: file not found: {input_file}")
+            sys.exit(1)
+
+        cProfile.run('main(input_file,totalMonitors,aspect,scale,targetFPS)', 'profile_data.prof')
