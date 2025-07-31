@@ -1,5 +1,0 @@
-mon = peripheral.find("monitor")
-mon.setTextScale(0.5)
-print("0.5:",mon.getSize())
-mon.setTextScale(1)
-print("1:",mon.getSize())
