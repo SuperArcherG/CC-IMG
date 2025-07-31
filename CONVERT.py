@@ -12,6 +12,7 @@ poolSize = 16
 OverideQueueSize = False
 queueSize = 128
 careAboutExtraEdgePixels = True
+profile = False
 
 # total_res = (math.floor(188.5 / scale) * aspect[0], math.floor(126 / scale) * aspect[1])
 
@@ -287,9 +288,6 @@ def mp4_to_frames(input_path,targetFPS,total_res):
 
             if not frames_batch:
                 break
-            
-            global start
-            start = time.time()
 
             for done_frame in pool.imap_unordered(process_frame, frames_batch, chunksize=4):
                 print(f"Finished frame {done_frame + 1} / {total_frames}", end='\r', flush=True)
@@ -351,5 +349,14 @@ if __name__ == "__main__":
         if not os.path.exists(input_file):
             print(f"Error: file not found: {input_file}")
             sys.exit(1)
-        # main(input_file,totalMonitors,aspect,scale,targetFPS)
-        cProfile.run('main(input_file,totalMonitors,aspect,scale,targetFPS)', 'profile_data.prof')
+        
+        if profile:
+            pr = cProfile.Profile()
+            pr.enable()
+
+            cProfile.run('main(input_file,totalMonitors,aspect,scale,targetFPS)', 'profile_data.prof')
+
+            pr.disable()
+            pr.dump_stats('profile_data.prof')
+        else:
+            main(input_file,totalMonitors,aspect,scale,targetFPS)
