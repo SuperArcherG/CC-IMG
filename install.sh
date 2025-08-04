@@ -4,7 +4,7 @@ set -e
 
 echo "=== Checking Python version ==="
 
-PYTHON=$(which python3 || which python)
+PYTHON=$(which python3.11)
 PY_VER=$($PYTHON -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
 
 echo "Detected Python version: $PY_VER"
@@ -13,19 +13,18 @@ echo "Detected Python version: $PY_VER"
 PY_OK=$($PYTHON -c 'import sys; print(sys.version_info < (3, 12))')
 
 if [[ "$PY_OK" != "True" ]]; then
-    echo "❌ Python 3.12 or newer detected. PyTorch may not yet support this."
     echo "Please run with Python 3.11."
     exit 1
 fi
 
 echo "✅ Python version is suitable."
 
-echo "=== Checking for pip ==="
-if ! command -v pip &> /dev/null; then
-    echo "❌ pip not found. Installing pip..."
-    curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py
-    $PYTHON get-pip.py
-fi
+# echo "=== Checking for pip ==="
+# if ! command -v pip &> /dev/null; then
+#     echo "❌ pip not found. Installing pip..."
+#     curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py
+#     $PYTHON get-pip.py
+# fi
 
 echo "=== Installing dependencies ==="
 
