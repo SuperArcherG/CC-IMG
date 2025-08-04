@@ -62,11 +62,11 @@ echo "=== Installing PyTorch ==="
 # Use official selector to install torch for current OS and Python
 if [[ -n "$CUDA_VERSION" ]]; then
     # For Linux, Mac, Windows (wheel auto-resolves CUDA)
-    python3.10 -m pip install torch --index-url https://download.pytorch.org/whl/cu121
+    python3.10 -m pip install torch --index-url https://download.pytorch.org/whl/cu113
 else
     python3.10 -m pip install torch
 fi
 
 echo "✅ All done!"
 
-echo "Reminder USE PYTHON 3.11"
+echo "Reminder USE PYTHON 3.11 or lower"
