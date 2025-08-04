@@ -1,5 +1,6 @@
 from PIL import Image
 from multiprocessing import Pool, cpu_count
+import multiprocessing as mp
 import sys, os, math, torch, time, cv2, ffmpeg, json, subprocess, numpy as np, re, shutil, gc
 
 
@@ -15,7 +16,7 @@ queueSize = 128
 careAboutExtraEdgePixels = False
 profile = False
 displayProgress = True
-legacySupport = True
+legacyGPUSupport = True
 
 # total_res = (math.floor(188.5 / scale) * aspect[0], math.floor(126 / scale) * aspect[1])
 
@@ -254,7 +255,7 @@ def mp4_to_frames(input_path,targetFPS,total_res):
     current_fps = get_fps(input_path)
     if current_fps > targetFPS:
         print(f"Resampling {current_fps} to {targetFPS} FPS") 
-        if not legacySupport:
+        if not legacyGPUSupport:
             (
                 ffmpeg
                 .input(input_path, hwaccel='cuda', hwaccel_device=0)
@@ -351,6 +352,8 @@ def main(input_path,totalMonitors,aspect,scale,targetFPS):
     output_dir = re.sub(r'[^a-zA-Z0-9]', '', os.path.basename(input_path).split('.')[0]).upper()
     print(f"Final size: {get_folder_size(output_dir)/ (1024 * 1024):.2f} MB")
 if __name__ == "__main__":
+    if legacyGPUSupport:
+        mp.set_start_method('spawn', force=True)
     with cProfile.Profile() as pr:
         if len(sys.argv) < 7:
             print("Usage: python convert.py <media_file (Any* Image / GIF / mp4, avi, mov, mkv)> <Block Width> <Block Height> <Cell # X> <Cell # Y> <Text Scale> <FPS <= 20 (Optional)>")
