@@ -10,11 +10,11 @@ PY_VER=$($PYTHON -c 'import sys; print(f"{sys.version_info.major}.{sys.version_i
 echo "Detected Python version: $PY_VER"
 
 # Compare version strings
-PY_OK=$($PYTHON -c 'import sys; print(sys.version_info < (3, 13))')
+PY_OK=$($PYTHON -c 'import sys; print(sys.version_info < (3, 12))')
 
 if [[ "$PY_OK" != "True" ]]; then
-    echo "❌ Python 3.13 or newer detected. PyTorch may not yet support this."
-    echo "Please downgrade to Python 3.12 or earlier."
+    echo "❌ Python 3.12 or newer detected. PyTorch may not yet support this."
+    echo "Please run with Python 3.11."
     exit 1
 fi
 
@@ -38,7 +38,7 @@ REQUIRED_PKGS=(
 
 for pkg in "${REQUIRED_PKGS[@]}"; do
     echo "Installing $pkg..."
-    pip install "$pkg"
+    python3.11 -m pip install "$pkg"
 done
 
 echo "=== Detecting CUDA version (if any) ==="
@@ -63,9 +63,11 @@ echo "=== Installing PyTorch ==="
 # Use official selector to install torch for current OS and Python
 if [[ -n "$CUDA_VERSION" ]]; then
     # For Linux, Mac, Windows (wheel auto-resolves CUDA)
-    pip install torch --index-url https://download.pytorch.org/whl/cu121
+    python3.11 -m pip install torch --index-url https://download.pytorch.org/whl/cu121
 else
-    pip install torch
+    python3.11 -m pip install torch
 fi
 
 echo "✅ All done!"
+
+echo "Reminder USE PYTHON 3.11"
