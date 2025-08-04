@@ -297,7 +297,7 @@ def mp4_to_frames(input_path,targetFPS,total_res):
                 break
             
             frameCalcStart = time.time()
-            for finishedFrame in list(pool.imap_unordered(process_frame, frames_batch)):
+            for finishedFrame in pool.imap_unordered(process_frame, frames_batch):
                 if (displayProgress):
                     print(f"Finished frame {finishedFrame + 1} / {total_frames}", end='\r', flush=True)
 
