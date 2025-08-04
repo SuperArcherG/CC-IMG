@@ -15,6 +15,7 @@ queueSize = 128
 careAboutExtraEdgePixels = False
 profile = False
 displayProgress = True
+legacySupport = True
 
 # total_res = (math.floor(188.5 / scale) * aspect[0], math.floor(126 / scale) * aspect[1])
 
@@ -252,16 +253,27 @@ def mp4_to_frames(input_path,targetFPS,total_res):
 
     current_fps = get_fps(input_path)
     if current_fps > targetFPS:
-        print(f"Resampling {current_fps} to {targetFPS} FPS")  
-        (
+        print(f"Resampling {current_fps} to {targetFPS} FPS") 
+        if not legacySupport:
+            (
+                ffmpeg
+                .input(input_path, hwaccel='cuda', hwaccel_device=0)
+                .filter('fps', fps=targetFPS, round='up')
+                .filter('scale', width=calc[0], height=calc[1])
+                .output(output_dir + "\\TMP.mp4", vcodec='h264_nvenc')
+                .global_args('-loglevel', 'error')
+                .run(overwrite_output=True)
+            )
+        else:
+            (
             ffmpeg
-            .input(input_path, hwaccel='cuda', hwaccel_device=0)
-            .filter('fps', fps=targetFPS, round='up')
-            .filter('scale', width=calc[0], height=calc[1])
-            .output(output_dir + "\\TMP.mp4", vcodec='h264_nvenc')
-            .global_args('-loglevel', 'error')
-            .run(overwrite_output=True)
-        )
+                .input(input_path, hwaccel='cuda', hwaccel_device=0)
+                .filter('fps', fps=targetFPS, round='up')
+                .filter('scale', width=calc[0], height=calc[1])
+                .output(output_dir + "\\TMP.mp4", vcodec='libx264')
+                .global_args('-loglevel', 'error')
+                .run(overwrite_output=True)
+            )
         input_path = output_dir + "\\TMP.mp4"
     else:
         print(f"Video at {targetFPS} FPS already")    
