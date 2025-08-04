@@ -38,7 +38,7 @@ REQUIRED_PKGS=(
 
 for pkg in "${REQUIRED_PKGS[@]}"; do
     echo "Installing $pkg..."
-    pip install --break-system-packages "$pkg"
+    pip install "$pkg"
 done
 
 echo "=== Detecting CUDA version (if any) ==="
@@ -63,9 +63,9 @@ echo "=== Installing PyTorch ==="
 # Use official selector to install torch for current OS and Python
 if [[ -n "$CUDA_VERSION" ]]; then
     # For Linux, Mac, Windows (wheel auto-resolves CUDA)
-    pip install --break-system-packages torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+    pip install torch --index-url https://download.pytorch.org/whl/cu121
 else
-    pip install --break-system-packages torch torchvision torchaudio
+    pip install torch
 fi
 
 echo "✅ All done!"
