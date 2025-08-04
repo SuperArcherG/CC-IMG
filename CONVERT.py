@@ -6,13 +6,15 @@ import sys, os, math, torch, time, cv2, ffmpeg, json, subprocess, numpy as np, r
 import cProfile
 
 start = time.time()
+frameCalcStart = 0
 
 # # # PERFORMANCE SETTINGS
 poolSize = 16
 OverideQueueSize = False
 queueSize = 128
-careAboutExtraEdgePixels = True
+careAboutExtraEdgePixels = False
 profile = False
+displayProgress = True
 
 # total_res = (math.floor(188.5 / scale) * aspect[0], math.floor(126 / scale) * aspect[1])
 
@@ -272,11 +274,13 @@ def mp4_to_frames(input_path,targetFPS,total_res):
     frame_number = 0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     maxCache = queueSize if OverideQueueSize else total_frames
+    global frameCalcStart
+
+    frameCalcStart = time.time()
 
     # Prepare multiprocessing pool
     with Pool(processes=min(poolSize,cpu_count())) as pool:
-        read_frames = 0
-        while read_frames < total_frames:
+        while True:
             frames_batch = []
             for _ in range(maxCache):  # Batch size
                 ret, frame = cap.read()
@@ -284,13 +288,18 @@ def mp4_to_frames(input_path,targetFPS,total_res):
                     break
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 frames_batch.append((frame_number, frame_rgb, total_res, output_dir, aspect, not careAboutExtraEdgePixels))
+                if (displayProgress):
+                    print(f"Loading frame into memory {frame_number + 1} / {total_frames}", end='\r', flush=True)
+                pass
                 frame_number += 1
 
             if not frames_batch:
                 break
-
-            for done_frame in pool.imap_unordered(process_frame, frames_batch, chunksize=4):
-                print(f"Finished frame {done_frame + 1} / {total_frames}", end='\r', flush=True)
+            
+            frameCalcStart = time.time()
+            for finishedFrame in list(pool.imap_unordered(process_frame, frames_batch)):
+                if (displayProgress):
+                    print(f"Finished frame {finishedFrame + 1} / {total_frames}", end='\r', flush=True)
 
             torch.cuda.empty_cache()
             gc.collect()
@@ -325,6 +334,7 @@ def main(input_path,totalMonitors,aspect,scale,targetFPS):
         print("Unsupported file type.")
     end = time.time()
     print(f"Elapsed time: {end - start:.2f} seconds")
+    print(f"Time for frames: {end - frameCalcStart:.2f} seconds")
 
     output_dir = re.sub(r'[^a-zA-Z0-9]', '', os.path.basename(input_path).split('.')[0]).upper()
     print(f"Final size: {get_folder_size(output_dir)/ (1024 * 1024):.2f} MB")
