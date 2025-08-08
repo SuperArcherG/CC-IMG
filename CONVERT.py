@@ -13,7 +13,7 @@ frameCalcStart = 0
 poolSize = 16
 OverideQueueSize = False
 queueSize = 128
-careAboutExtraEdgePixels = False
+careAboutExtraEdgePixels = True
 profile = False
 displayProgress = True
 legacyGPUSupport = True
@@ -261,7 +261,7 @@ def mp4_to_frames(input_path,targetFPS,total_res):
                 .input(input_path, hwaccel='cuda', hwaccel_device=0)
                 .filter('fps', fps=targetFPS, round='up')
                 .filter('scale', width=calc[0], height=calc[1])
-                .output(output_dir + "\\TMP.mp4", vcodec='h264_nvenc')
+                .output(output_dir + "/TMP.mp4", vcodec='h264_nvenc')
                 .global_args('-loglevel', 'error')
                 .run(overwrite_output=True)
             )
@@ -271,11 +271,11 @@ def mp4_to_frames(input_path,targetFPS,total_res):
                 .input(input_path, hwaccel='cuda', hwaccel_device=0)
                 .filter('fps', fps=targetFPS, round='up')
                 .filter('scale', width=calc[0], height=calc[1])
-                .output(output_dir + "\\TMP.mp4", vcodec='libx264')
+                .output(output_dir + "/TMP.mp4", vcodec='libx264')
                 .global_args('-loglevel', 'error')
                 .run(overwrite_output=True)
             )
-        input_path = output_dir + "\\TMP.mp4"
+        input_path = output_dir + "/TMP.mp4"
     else:
         print(f"Video at {targetFPS} FPS already")    
 
