@@ -19,7 +19,7 @@ start = time.time()
 frameCalcStart = 0
 
 # # # PERFORMANCE SETTINGS (tweakable)
-poolSize = 5                 # number of CPU producers (workers)
+poolSize = 12                 # number of CPU producers (workers)
 OverideQueueSize = False
 queueSize = 1
 careAboutExtraEdgePixels = True

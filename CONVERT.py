@@ -24,14 +24,14 @@ start = time.time()
 frameCalcStart = 0
 
 # # # PERFORMANCE SETTINGS
-poolSize = 1
+poolSize = 12
 OverideQueueSize = False
 queueSize = 1
 careAboutExtraEdgePixels = False
 profile = False
 displayProgress = True
 legacyGPUSupport = False
-dither = True
+dither = False
 
 # total_res = (math.floor(188.5 / scale) * aspect[0], math.floor(126 / scale) * aspect[1])
 
