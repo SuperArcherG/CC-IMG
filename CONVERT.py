@@ -1,24 +1,17 @@
 from PIL import Image
 from multiprocessing import Pool, cpu_count
 import multiprocessing as mp
-import sys, os, math, torch, time, cv2, ffmpeg, json, subprocess, numpy as np, re, shutil, gc
-import psutil
+import sys, os, math, torch, time, cv2, ffmpeg, json, subprocess, numpy as np, re, shutil, gc, psutil, threading, cv2, kornia
 import cProfile
+from skimage.color import rgb2lab
 
-
-#TIME TO BEAT 276
-#TIME TO BEAT 294
-
-def get_allowed_cores(num_cores, skip_core0=True):
-    cores = list(range(psutil.cpu_count(logical=True)))
-    if skip_core0 and 0 in cores:
-        cores.remove(0)
-    return cores[:num_cores]
-
-def init_worker(cores):
-    p = psutil.Process()
-    p.cpu_affinity(cores)
-
+# Ensure environment variables for thread control before Pools are created
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+os.environ.setdefault('MKL_NUM_THREADS', '1')
+try:
+    torch.set_num_threads(1)
+except Exception:
+    pass
 
 start = time.time()
 frameCalcStart = 0
@@ -31,28 +24,52 @@ careAboutExtraEdgePixels = False
 profile = False
 displayProgress = True
 legacyGPUSupport = False
-dither = False
+dither = True
 
-# total_res = (math.floor(188.5 / scale) * aspect[0], math.floor(126 / scale) * aspect[1])
-
+# Palette (official ComputerCraft default colors)
 cc_palette = {
-    1:    (255, 255, 255),  # white
-    2:    (216, 127, 51),   # orange
-    4:    (178, 76, 216),   # magenta
-    8:    (102, 153, 216),  # lightBlue
-    16:   (229, 229, 51),   # yellow
-    32:   (127, 204, 25),   # lime
-    64:   (242, 127, 165),  # pink
-    128:  (76, 76, 76),     # gray
-    256:  (153, 153, 153),  # lightGray
-    512:  (76, 127, 153),   # cyan
-    1024: (127, 63, 178),   # purple
-    2048: (51, 76, 178),    # blue
-    4096: (102, 76, 51),    # brown
-    8192: (102, 127, 51),   # green
-    16384:(153, 51, 51),    # red
-    32768:(25, 25, 25),     # black
+    1:     (240, 240, 240),  # White       #F0F0F0
+    2:     (242, 178, 51),   # Orange      #F2B233
+    4:     (229, 127, 216),  # Magenta     #E57FD8
+    8:     (153, 178, 242),  # Light Blue  #99B2F2
+    16:    (222, 222, 108),  # Yellow      #DEDE6C
+    32:    (127, 204, 25),   # Lime        #7FCC19
+    64:    (242, 178, 204),  # Pink        #F2B2CC
+    128:   (76, 76, 76),     # Gray        #4C4C4C
+    256:   (153, 153, 153),  # Light Gray  #999999
+    512:   (76, 153, 178),   # Cyan        #4C99B2
+    1024:  (178, 102, 229),  # Purple      #B266E5
+    2048:  (51, 102, 204),   # Blue        #3366CC
+    4096:  (127, 102, 76),   # Brown       #7F664C
+    8192:  (87, 166, 78),    # Green       #57A64E
+    16384: (204, 76, 76),    # Red         #CC4C4C
+    32768: (17, 17, 17),     # Black       #111111
 }
+
+# utility: pin workers to allowed cores (caller passes list of cores)
+def init_worker(cores):
+    p = psutil.Process()
+    try:
+        p.cpu_affinity(cores)
+    except Exception:
+        pass
+    # reduce thread usage in each worker
+    try:
+        torch.set_num_threads(1)
+    except Exception:
+        pass
+    os.environ.setdefault('OMP_NUM_THREADS', '1')
+    os.environ.setdefault('MKL_NUM_THREADS', '1')
+
+# picklable CPU-side helper (top-level)
+def cpu_preprocess_task(item):
+    """
+    item: (idx, frame_rgb, total_res, output_dir, aspect, precalc_flag, total_frames)
+    Return: (idx, frame_rgb)
+    Keep this minimal — no CUDA calls here.
+    """
+    idx, frame_rgb, *rest = item
+    return (idx, frame_rgb)
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -62,103 +79,160 @@ if not torch.cuda.is_available():
 cc_palette_keys = torch.tensor(list(cc_palette.keys()))
 cc_palette_colors = torch.tensor(list(cc_palette.values()), dtype=torch.float32) / 255.0
 
-# cc_palette_colors = cc_palette_colors.to(torch.float32)
+# build sRGB palette (0..1)
+palette_srgb = torch.tensor(list(cc_palette.values()), dtype=torch.float32, device=device).div_(255.0)  # (P,3)
 
-## TOP CONTENDER float8_e5m2
+# convert palette to kornia-friendly format: (1,3,P,1) -> rgb_to_lab -> (1,3,P,1) -> (P,3)
+# This keeps conversion identical to kornia's frame conversion
+pal = palette_srgb.clone().permute(1, 0).unsqueeze(0).unsqueeze(-1)   # (1, 3, P, 1)
+pal_lab = kornia.color.rgb_to_lab(pal)                                # (1, 3, P, 1)
+palette_lab = pal_lab.permute(0, 2, 3, 1).reshape(-1, 3).to(device)    # (P,3) Lab on device
 
-palette = cc_palette_colors.to(device)
+# keep palette_keys for final mapping (on device)
 palette_keys = cc_palette_keys.to(device)
 
+
+# The dithering functions (kept as your chosen implementation, using globals)
 @torch.no_grad()
 def closest_cc(image_array):
-
-    img_tensor = torch.from_numpy(image_array).to(device).div(255)
-
-    H, W, _ = img_tensor.shape # Height, Width, Discard Color
-
-    pixels = img_tensor.view(-1, 3) # Flattens the image tensor from (H, W, 3) to (H*W, 3), making a 2D tensor where each row is one pixel’s RGB.
-
-    dists = torch.cdist(pixels, palette)
-
+    img_tensor = torch.from_numpy(image_array).to(device).float().div_(255.0)   # (H,W,3) sRGB 0..1
+    # convert to (1,3,H,W), then to Lab, back to (H,W,3) and drop batch:
+    img_lab = kornia.color.rgb_to_lab(img_tensor.permute(2,0,1).unsqueeze(0))    # (1,3,H,W)
+    img_lab = img_lab.permute(0,2,3,1)[0]                                      # (H,W,3) Lab
+    H, W, _ = img_lab.shape
+    flat = img_lab.reshape(-1, 3)
+    dists = torch.cdist(flat, palette_lab)   # compare in Lab-space
     nearest_idxs = torch.argmin(dists, dim=1)
-
-    keys = palette_keys[nearest_idxs].to("cpu")
-    return keys.view(H, W).numpy()
+    keys = palette_keys[nearest_idxs].to('cpu')
+    return keys.reshape(H, W).numpy()
 
 
 
 @torch.no_grad()
 def closest_cc_dither(image_array):
-    img_tensor = torch.from_numpy(image_array).to(device).float().div(255.0)
-    H, W, _ = img_tensor.shape
-    
+    # Convert input to Lab
+    img_tensor = torch.from_numpy(image_array).to(device).float().div_(255.0)  # (H,W,3) sRGB
+    img_lab = kornia.color.rgb_to_lab(img_tensor.permute(2,0,1).unsqueeze(0)).permute(0,2,3,1)[0]  # (H,W,3)
+    H, W, _ = img_lab.shape
+
     # --- Horizontal Dither ---
-    out_idx_h = torch.empty((H, W), dtype=torch.int64, device=device)
-    work_img_h = img_tensor.clone()
+    work_img_h = img_lab.clone()
+    idx_h = torch.empty((H, W), dtype=torch.long, device=device)  # store palette index positions (0..P-1)
 
     for y in range(H):
-        row_pixels = work_img_h[y]
-        dists = torch.cdist(row_pixels, palette)  # palette shape: (P, 3)
-        nearest_idxs = torch.argmin(dists, dim=1)  # 0-based palette indices
-        out_idx_h[y] = nearest_idxs
-        chosen_rgb = palette[nearest_idxs]
-        error = row_pixels - chosen_rgb
+        row_pixels = work_img_h[y]  # (W,3) Lab
+        dists = torch.cdist(row_pixels.reshape(-1,3), palette_lab)
+        nearest_idxs = torch.argmin(dists, dim=1)  # palette indices
+        idx_h[y] = nearest_idxs
+        chosen_lab = palette_lab[nearest_idxs]
+        error = row_pixels - chosen_lab
 
         if W > 1:
-            work_img_h[y, 1:] += error[:-1] * (7 / 16)
-
+            work_img_h[y, 1:] += error[:-1] * (7/16)
         if y + 1 < H:
             if W > 1:
-                work_img_h[y + 1, :-1] += error[1:] * (3 / 16)
-            work_img_h[y + 1, :] += error * (5 / 16)
+                work_img_h[y+1, :-1] += error[1:] * (3/16)
+            work_img_h[y+1, :] += error * (5/16)
             if W > 2:
-                work_img_h[y + 1, 1:] += error[:-1] * (1 / 16)
-
-        work_img_h[y] = torch.clamp(work_img_h[y], 0, 1)
-        if y + 1 < H:
-            work_img_h[y + 1] = torch.clamp(work_img_h[y + 1], 0, 1)
+                work_img_h[y+1, 1:] += error[:-1] * (1/16)
 
     # --- Vertical Dither ---
-    out_idx_v = torch.empty((H, W), dtype=torch.int64, device=device)
-    work_img_v = img_tensor.clone()
+    work_img_v = img_lab.clone()
+    idx_v = torch.empty((H, W), dtype=torch.long, device=device)
 
     for x in range(W):
-        col_pixels = work_img_v[:, x, :]
-        dists = torch.cdist(col_pixels, palette)
+        col_pixels = work_img_v[:, x, :]  # (H,3) Lab
+        dists = torch.cdist(col_pixels.reshape(-1,3), palette_lab)
         nearest_idxs = torch.argmin(dists, dim=1)
-        out_idx_v[:, x] = nearest_idxs
-        chosen_rgb = palette[nearest_idxs]
-        error = col_pixels - chosen_rgb
+        idx_v[:, x] = nearest_idxs
+        chosen_lab = palette_lab[nearest_idxs]
+        error = col_pixels - chosen_lab
 
         if H > 1:
-            work_img_v[1:, x] += error[:-1] * (7 / 16)
-
+            work_img_v[1:, x] += error[:-1] * (7/16)
         if x + 1 < W:
             if H > 1:
-                work_img_v[:-1, x + 1] += error[1:] * (3 / 16)
-            work_img_v[:, x + 1] += error * (5 / 16)
+                work_img_v[:-1, x+1] += error[1:] * (3/16)
+            work_img_v[:, x+1] += error * (5/16)
             if H > 2:
-                work_img_v[1:, x + 1] += error[:-1] * (1 / 16)
+                work_img_v[1:, x+1] += error[:-1] * (1/16)
 
-        work_img_v[:, x] = torch.clamp(work_img_v[:, x], 0, 1)
-        if x + 1 < W:
-            work_img_v[:, x + 1] = torch.clamp(work_img_v[:, x + 1], 0, 1)
+    # --- Mix results in Lab space ---
+    lab_h = palette_lab[idx_h]
+    lab_v = palette_lab[idx_v]
+    lab_avg = (lab_h + lab_v) / 2
 
-    # --- Mix results in color space ---
-    rgb_h = palette[out_idx_h]  # (H, W, 3)
-    rgb_v = palette[out_idx_v]  # (H, W, 3)
-    rgb_avg = (rgb_h + rgb_v) / 2
+    # Remap averaged Lab colors back to nearest palette entry
+    dists = torch.cdist(lab_avg.reshape(-1, 3), palette_lab)
+    final_idxs = torch.argmin(dists, dim=1).reshape(H, W)
 
-    # Re-map averaged RGB colors back to nearest palette entry
-    dists = torch.cdist(rgb_avg.view(-1, 3), palette)
-    nearest_idxs = torch.argmin(dists, dim=1).view(H, W)  # 0-based indices
-
-    # Final mapping to palette_keys
-    out_keys = palette_keys[nearest_idxs]  # shape (H, W)
-
+    # Convert final palette indices to block keys
+    out_keys = palette_keys[final_idxs]
     return out_keys.cpu().numpy()
 
 
+
+# GPU consumer — owns CUDA, batches frames from frame_queue, dithers & writes files
+def gpu_consumer(frame_queue: mp.Queue, output_dir: str, total_res, aspect, precalc_flag, status_queue: mp.Queue = None):
+    # initialize CUDA and move palette/keys to device here (only this process uses CUDA)
+    global device, palette, palette_keys
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    palette = cc_palette_colors.to(device)
+    palette_keys = cc_palette_keys.to(device)
+
+    BATCH_MAX = 8   # tune: 4..16 (more reduces IPC but increases latency)
+    while True:
+        item = frame_queue.get()
+        if item is None:
+            break
+        batch = [item]
+        # drain a few without blocking too long
+        for _ in range(BATCH_MAX - 1):
+            try:
+                nxt = frame_queue.get_nowait()
+            except Exception:
+                break
+            if nxt is None:
+                # ensure sentinel remains (will break outer loop after batch)
+                frame_queue.put(None)
+                break
+            batch.append(nxt)
+
+        # process batch sequentially in this process (no IPC)
+        for idx, frame_rgb in batch:
+            try:
+                out_path = os.path.join(output_dir, f"frame_{idx:03}.ccframe")
+                pil_img = Image.fromarray(frame_rgb)
+                convert_image_to_ccframe(img=pil_img, output_path=out_path, total_res=total_res, aspect=aspect, precalc=precalc_flag)
+                if status_queue is not None:
+                    status_queue.put(('finished', idx))
+            except Exception as e:
+                # Log error to status queue so main process can print
+                if status_queue is not None:
+                    status_queue.put(('error', f"{idx}:{e}"))
+                else:
+                    print("GPU consumer error:", e)
+
+
+# listener thread — centralizes prints in the main process
+def status_listener(status_queue: mp.Queue, total_frames: int, displayProgress: bool = True):
+    last_loaded = -1
+    while True:
+        msg = status_queue.get()
+        if msg is None:
+            break
+        typ, payload = msg
+        if typ == 'finished':
+            idx = payload
+            if displayProgress:
+                print(f"Finished frame {idx + 1} / {total_frames}\033[K", end='\r', flush=True)
+        elif typ == 'loaded':
+            idx = payload
+            # reduce print frequency for loaded messages
+            if displayProgress and (idx % 10 == 0):
+                print(f"Loading frame into memory {idx + 1} / {total_frames}\033[K", end='\r', flush=True)
+        elif typ == 'error':
+            print("Worker error:", payload)
 
 
 
@@ -328,6 +402,12 @@ def get_video_resolution(path):
     height = info['streams'][0]['height']
     return width, height
 
+# Utility: allowed cores list (skip core 0 by default)
+def get_allowed_cores(num_cores, skip_core0=True):
+    cores = list(range(psutil.cpu_count(logical=True)))
+    if skip_core0 and 0 in cores:
+        cores.remove(0)
+    return cores[:num_cores]
 
 def mp4_to_frames(input_path,targetFPS,total_res):
     
@@ -396,38 +476,72 @@ def mp4_to_frames(input_path,targetFPS,total_res):
 
     frameCalcStart = time.time()
 
+    # Prepare multiprocessing pool (CPU producers)
+    allowed_cores = get_allowed_cores(poolSize, skip_core0=True)
+    producer_pool = Pool(processes=len(allowed_cores), initializer=init_worker, initargs=(allowed_cores,))
+
+    # frame queue and status queue
+    frame_queue = mp.Queue(maxsize=max(64, 8 * len(allowed_cores)))  # larger queue to decouple producers and consumer
+    status_queue = mp.Queue()
+
+    # start status listener thread in main process
+    listener_t = threading.Thread(target=status_listener, args=(status_queue, total_frames, displayProgress), daemon=True)
+    listener_t.start()
+
+    # start gpu consumer process (single process that owns CUDA)
+    gpu_proc = mp.Process(target=gpu_consumer, args=(frame_queue, output_dir, total_res, aspect, True, status_queue))
+    gpu_proc.start()
+
     # Prepare multiprocessing pool
     allowed_cores = get_allowed_cores(poolSize, skip_core0=True)
-    with Pool(
-        processes=len(allowed_cores),
-        initializer=init_worker,
-        initargs=(allowed_cores,)
-    ) as pool:
+    try:
         while True:
             frames_batch = []
-            for _ in range(maxCache):  # Batch size
+            for _ in range(maxCache):
                 ret, frame = cap.read()
                 if not ret:
                     break
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 frames_batch.append((frame_number, frame_rgb, total_res, output_dir, aspect, not careAboutExtraEdgePixels, total_frames))
-                if (displayProgress):
+                # only print occasional loading messages here to avoid I/O overhead
+                if displayProgress and frame_number % 20 == 0:
                     print(f"Loading frame into memory {frame_number + 1} / {total_frames}\033[K", end='\r', flush=True)
-                pass
                 frame_number += 1
 
             if not frames_batch:
                 break
-            
-            frameCalcStart = time.time()
 
-            for finishedFrame in pool.imap_unordered(process_frame, frames_batch):
-                if (displayProgress):
-                    print(f"Finished frame {finishedFrame + 1} / {total_frames}\033[K", end='\r', flush=True)
+            # Map to CPU pool to do (minimal) preprocessing — returns (idx, frame_rgb)
+            # chunksize reduces scheduling overhead — tune if needed
+            for result in producer_pool.imap_unordered(cpu_preprocess_task, frames_batch, chunksize=4):
+                # put into frame_queue; will block if queue is full (backpressure)
+                frame_queue.put(result)
 
-                    
-            torch.cuda.empty_cache()
+            # Avoid aggressive cache clearing each loop — we'll clear after finish
             gc.collect()
+
+    finally:
+        # all frames queued; shut down producers and consumers cleanly
+        producer_pool.close()
+        producer_pool.join()
+
+        # signal consumer to stop
+        frame_queue.put(None)
+        gpu_proc.join()
+
+        # stop listener thread
+        status_queue.put(None)
+        listener_t.join()
+
+        cap.release()
+
+        # cleanup
+        try:
+            os.remove(input_path)
+        except OSError:
+            pass
+
+    torch.cuda.empty_cache()
 
     cap.release()
 

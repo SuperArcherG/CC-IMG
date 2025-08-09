@@ -5,6 +5,9 @@ import multiprocessing as mp
 import sys, os, math, torch, time, cv2, ffmpeg, json, subprocess, numpy as np, re, shutil, gc
 import psutil
 import threading
+import cv2
+from skimage.color import rgb2lab
+import kornia
 
 # Ensure environment variables for thread control before Pools are created
 os.environ.setdefault('OMP_NUM_THREADS', '1')
@@ -23,30 +26,31 @@ poolSize = 12                 # number of CPU producers (workers)
 OverideQueueSize = False
 queueSize = 1
 careAboutExtraEdgePixels = True
-profile = False
+profile = True
 displayProgress = True
 legacyGPUSupport = False
-dither = False
+dither = True
 
-# Palette (same as yours)
+# Palette (official ComputerCraft default colors)
 cc_palette = {
-    1:    (255, 255, 255),  # white
-    2:    (216, 127, 51),   # orange
-    4:    (178, 76, 216),   # magenta
-    8:    (102, 153, 216),  # lightBlue
-    16:   (229, 229, 51),   # yellow
-    32:   (127, 204, 25),   # lime
-    64:   (242, 127, 165),  # pink
-    128:  (76, 76, 76),     # gray
-    256:  (153, 153, 153),  # lightGray
-    512:  (76, 127, 153),   # cyan
-    1024: (127, 63, 178),   # purple
-    2048: (51, 76, 178),    # blue
-    4096: (102, 76, 51),    # brown
-    8192: (102, 127, 51),   # green
-    16384:(153, 51, 51),    # red
-    32768:(25, 25, 25),     # black
+    1:     (240, 240, 240),  # White       #F0F0F0
+    2:     (242, 178, 51),   # Orange      #F2B233
+    4:     (229, 127, 216),  # Magenta     #E57FD8
+    8:     (153, 178, 242),  # Light Blue  #99B2F2
+    16:    (222, 222, 108),  # Yellow      #DEDE6C
+    32:    (127, 204, 25),   # Lime        #7FCC19
+    64:    (242, 178, 204),  # Pink        #F2B2CC
+    128:   (76, 76, 76),     # Gray        #4C4C4C
+    256:   (153, 153, 153),  # Light Gray  #999999
+    512:   (76, 153, 178),   # Cyan        #4C99B2
+    1024:  (178, 102, 229),  # Purple      #B266E5
+    2048:  (51, 102, 204),   # Blue        #3366CC
+    4096:  (127, 102, 76),   # Brown       #7F664C
+    8192:  (87, 166, 78),    # Green       #57A64E
+    16384: (204, 76, 76),    # Red         #CC4C4C
+    32768: (17, 17, 17),     # Black       #111111
 }
+
 
 # Globals for device/palette (will be reinitialized in GPU consumer process)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -56,10 +60,17 @@ if not torch.cuda.is_available():
 cc_palette_keys = torch.tensor(list(cc_palette.keys()))
 cc_palette_colors = torch.tensor(list(cc_palette.values()), dtype=torch.float32) / 255.0
 
-# keep them as CPU tensors for now; moved to device inside GPU consumer
-palette = cc_palette_colors.to(device)
-palette_keys = cc_palette_keys.to(device)
+# build sRGB palette (0..1)
+palette_srgb = torch.tensor(list(cc_palette.values()), dtype=torch.float32, device=device).div_(255.0)  # (P,3)
 
+# convert palette to kornia-friendly format: (1,3,P,1) -> rgb_to_lab -> (1,3,P,1) -> (P,3)
+# This keeps conversion identical to kornia's frame conversion
+pal = palette_srgb.clone().permute(1, 0).unsqueeze(0).unsqueeze(-1)   # (1, 3, P, 1)
+pal_lab = kornia.color.rgb_to_lab(pal)                                # (1, 3, P, 1)
+palette_lab = pal_lab.permute(0, 2, 3, 1).reshape(-1, 3).to(device)    # (P,3) Lab on device
+
+# keep palette_keys for final mapping (on device)
+palette_keys = cc_palette_keys.to(device)
 
 # utility: pin workers to allowed cores (caller passes list of cores)
 def init_worker(cores):
@@ -76,7 +87,6 @@ def init_worker(cores):
     os.environ.setdefault('OMP_NUM_THREADS', '1')
     os.environ.setdefault('MKL_NUM_THREADS', '1')
 
-
 # picklable CPU-side helper (top-level)
 def cpu_preprocess_task(item):
     """
@@ -88,104 +98,99 @@ def cpu_preprocess_task(item):
     return (idx, frame_rgb)
 
 
-# The dithering functions (kept as your chosen implementation, using globals)
+
+
+#Raw image to cc color aproximation with no dithering
 @torch.no_grad()
 def closest_cc(image_array):
-    img_tensor = torch.from_numpy(image_array).to(device).div(255)
-    H, W, _ = img_tensor.shape
-    pixels = img_tensor.view(-1, 3)
-    dists = torch.cdist(pixels, palette)
+    img_tensor = torch.from_numpy(image_array).to(device).float().div_(255.0)   # (H,W,3) sRGB 0..1
+    # convert to (1,3,H,W), then to Lab, back to (H,W,3) and drop batch:
+    img_lab = kornia.color.rgb_to_lab(img_tensor.permute(2,0,1).unsqueeze(0))    # (1,3,H,W)
+    img_lab = img_lab.permute(0,2,3,1)[0]                                      # (H,W,3) Lab
+    H, W, _ = img_lab.shape
+    flat = img_lab.reshape(-1, 3)
+    dists = torch.cdist(flat, palette_lab)   # compare in Lab-space
     nearest_idxs = torch.argmin(dists, dim=1)
-    keys = palette_keys[nearest_idxs].to("cpu")
-    return keys.view(H, W).numpy()
+    keys = palette_keys[nearest_idxs].to('cpu')
+    return keys.reshape(H, W).numpy()
 
-
+#Image to cc color aproximation with dithering
 @torch.no_grad()
 def closest_cc_dither(image_array):
-    img_tensor = torch.from_numpy(image_array).to(device).float().div(255.0)
-    H, W, _ = img_tensor.shape
+    # Convert input to Lab
+    img_tensor = torch.from_numpy(image_array).to(device).float().div_(255.0)  # (H,W,3) sRGB
+    img_lab = kornia.color.rgb_to_lab(img_tensor.permute(2,0,1).unsqueeze(0)).permute(0,2,3,1)[0]  # (H,W,3)
+    H, W, _ = img_lab.shape
 
     # --- Horizontal Dither ---
-    out_idx_h = torch.empty((H, W), dtype=torch.int64, device=device)
-    work_img_h = img_tensor.clone()
+    work_img_h = img_lab.clone()
+    idx_h = torch.empty((H, W), dtype=torch.long, device=device)  # store palette index positions (0..P-1)
 
     for y in range(H):
-        row_pixels = work_img_h[y]
-        dists = torch.cdist(row_pixels, palette)  # palette shape: (P, 3)
-        nearest_idxs = torch.argmin(dists, dim=1)  # 0-based palette indices
-        out_idx_h[y] = nearest_idxs
-        chosen_rgb = palette[nearest_idxs]
-        error = row_pixels - chosen_rgb
+        row_pixels = work_img_h[y]  # (W,3) Lab
+        dists = torch.cdist(row_pixels.reshape(-1,3), palette_lab)
+        nearest_idxs = torch.argmin(dists, dim=1)  # palette indices
+        idx_h[y] = nearest_idxs
+        chosen_lab = palette_lab[nearest_idxs]
+        error = row_pixels - chosen_lab
 
         if W > 1:
-            work_img_h[y, 1:] += error[:-1] * (7 / 16)
-
+            work_img_h[y, 1:] += error[:-1] * (7/16)
         if y + 1 < H:
             if W > 1:
-                work_img_h[y + 1, :-1] += error[1:] * (3 / 16)
-            work_img_h[y + 1, :] += error * (5 / 16)
+                work_img_h[y+1, :-1] += error[1:] * (3/16)
+            work_img_h[y+1, :] += error * (5/16)
             if W > 2:
-                work_img_h[y + 1, 1:] += error[:-1] * (1 / 16)
-
-        work_img_h[y] = torch.clamp(work_img_h[y], 0, 1)
-        if y + 1 < H:
-            work_img_h[y + 1] = torch.clamp(work_img_h[y + 1], 0, 1)
+                work_img_h[y+1, 1:] += error[:-1] * (1/16)
 
     # --- Vertical Dither ---
-    out_idx_v = torch.empty((H, W), dtype=torch.int64, device=device)
-    work_img_v = img_tensor.clone()
+    work_img_v = img_lab.clone()
+    idx_v = torch.empty((H, W), dtype=torch.long, device=device)
 
     for x in range(W):
-        col_pixels = work_img_v[:, x, :]
-        dists = torch.cdist(col_pixels, palette)
+        col_pixels = work_img_v[:, x, :]  # (H,3) Lab
+        dists = torch.cdist(col_pixels.reshape(-1,3), palette_lab)
         nearest_idxs = torch.argmin(dists, dim=1)
-        out_idx_v[:, x] = nearest_idxs
-        chosen_rgb = palette[nearest_idxs]
-        error = col_pixels - chosen_rgb
+        idx_v[:, x] = nearest_idxs
+        chosen_lab = palette_lab[nearest_idxs]
+        error = col_pixels - chosen_lab
 
         if H > 1:
-            work_img_v[1:, x] += error[:-1] * (7 / 16)
-
+            work_img_v[1:, x] += error[:-1] * (7/16)
         if x + 1 < W:
             if H > 1:
-                work_img_v[:-1, x + 1] += error[1:] * (3 / 16)
-            work_img_v[:, x + 1] += error * (5 / 16)
+                work_img_v[:-1, x+1] += error[1:] * (3/16)
+            work_img_v[:, x+1] += error * (5/16)
             if H > 2:
-                work_img_v[1:, x + 1] += error[:-1] * (1 / 16)
+                work_img_v[1:, x+1] += error[:-1] * (1/16)
 
-        work_img_v[:, x] = torch.clamp(work_img_v[:, x], 0, 1)
-        if x + 1 < W:
-            work_img_v[:, x + 1] = torch.clamp(work_img_v[:, x + 1], 0, 1)
+    # --- Mix results in Lab space ---
+    lab_h = palette_lab[idx_h]
+    lab_v = palette_lab[idx_v]
+    lab_avg = (lab_h + lab_v) / 2
 
-    # --- Mix results in color space ---
-    rgb_h = palette[out_idx_h]  # (H, W, 3)
-    rgb_v = palette[out_idx_v]  # (H, W, 3)
-    rgb_avg = (rgb_h + rgb_v) / 2
+    # Remap averaged Lab colors back to nearest palette entry
+    dists = torch.cdist(lab_avg.reshape(-1, 3), palette_lab)
+    final_idxs = torch.argmin(dists, dim=1).reshape(H, W)
 
-    # Re-map averaged RGB colors back to nearest palette entry
-    dists = torch.cdist(rgb_avg.reshape(-1, 3), palette)
-    nearest_idxs = torch.argmin(dists, dim=1).reshape(H, W)  # 0-based indices
-
-    # Final mapping to palette_keys
-    out_keys = palette_keys[nearest_idxs]  # shape (H, W)
-
+    # Convert final palette indices to block keys
+    out_keys = palette_keys[final_idxs]
     return out_keys.cpu().numpy()
 
 
-# Convert image -> ccframe (unchanged; will be called inside GPU consumer)
-def convert_image_to_ccframe(input_path="", img=None, output_path="", total_res=(-1, -1), aspect=(-1, -1), precalc=False):
-    ccname = ""
+
+
+# Convert image -> ccframe
+def convert_image_to_ccframe(input_path="", img=None, ccframe_path="", total_res=(-1, -1), aspect=(-1, -1), precalc=False):
     if img is None:
         print("Loading image:", input_path)
         img = Image.open(input_path).convert("RGB")
-        if output_path == "":
+        if ccframe_path == "":
             parts = input_path.split(".")
             parts.pop()
             new_filename = ".".join(parts) + ".bmp"
-            ccname = ".".join(parts) + ".ccframe"
-            output_path = new_filename
-    else:
-        ccname = output_path
+            ccframe_path = ".".join(parts) + ".ccframe"
+            ccframe_path = new_filename
 
     if not precalc:
         width, height = img.size
@@ -241,9 +246,8 @@ def convert_image_to_ccframe(input_path="", img=None, output_path="", total_res=
         lua_lines.append(f'  {{"{text_line}", "{text_color_line}", "{bg_line}"}},')
     lua_lines.append("}")
 
-    with open(ccname, "w") as f:
+    with open(ccframe_path, "w") as f:
         f.write("\n".join(lua_lines))
-
 
 # GPU consumer — owns CUDA, batches frames from frame_queue, dithers & writes files
 def gpu_consumer(frame_queue: mp.Queue, output_dir: str, total_res, aspect, precalc_flag, status_queue: mp.Queue = None):
@@ -276,7 +280,7 @@ def gpu_consumer(frame_queue: mp.Queue, output_dir: str, total_res, aspect, prec
             try:
                 out_path = os.path.join(output_dir, f"frame_{idx:03}.ccframe")
                 pil_img = Image.fromarray(frame_rgb)
-                convert_image_to_ccframe(img=pil_img, output_path=out_path, total_res=total_res, aspect=aspect, precalc=precalc_flag)
+                convert_image_to_ccframe(img=pil_img, ccframe_path=out_path, total_res=total_res, aspect=aspect, precalc=precalc_flag)
                 if status_queue is not None:
                     status_queue.put(('finished', idx))
             except Exception as e:
@@ -286,10 +290,8 @@ def gpu_consumer(frame_queue: mp.Queue, output_dir: str, total_res, aspect, prec
                 else:
                     print("GPU consumer error:", e)
 
-
 # listener thread — centralizes prints in the main process
 def status_listener(status_queue: mp.Queue, total_frames: int, displayProgress: bool = True):
-    last_loaded = -1
     while True:
         msg = status_queue.get()
         if msg is None:
@@ -302,13 +304,43 @@ def status_listener(status_queue: mp.Queue, total_frames: int, displayProgress: 
         elif typ == 'loaded':
             idx = payload
             # reduce print frequency for loaded messages
-            if displayProgress and (idx % 10 == 0):
-                print(f"Loading frame into memory {idx + 1} / {total_frames}\033[K", end='\r', flush=True)
+            print(f"Loading frame into memory {idx + 1} / {total_frames}\033[K", end='\r', flush=True)
         elif typ == 'error':
             print("Worker error:", payload)
 
 
-# Helpers for video metadata
+
+
+# QUERIES
+
+def get_allowed_cores(num_cores, skip_core0=True):
+    cores = list(range(psutil.cpu_count(logical=True)))
+    if skip_core0 and 0 in cores:
+        cores.remove(0)
+    return cores[:num_cores]
+
+def is_video_file(filepath):
+    video_extensions = [".mp4", ".avi", ".mov", ".mkv"]
+    ext = os.path.splitext(filepath)[1].lower()
+    return ext in video_extensions
+
+def is_image_file(filepath):
+    try:
+        with Image.open(filepath) as img:
+            img.verify()
+            if is_gif(filepath):
+                return False
+        return True
+    except Exception:
+        return False
+
+def is_gif(filepath):
+    try:
+        with Image.open(filepath) as img:
+            return img.format.upper() == "GIF"
+    except Exception:
+        return False
+
 def get_fps(path):
     cmd = [
         'ffprobe', '-v', 'error',
@@ -324,7 +356,6 @@ def get_fps(path):
     r_frame_rate = info['streams'][0]['r_frame_rate']  # like '30000/1001'
     num, den = map(int, r_frame_rate.split('/'))
     return num / den
-
 
 def get_video_resolution(path):
     cmd = [
@@ -342,16 +373,18 @@ def get_video_resolution(path):
     height = info['streams'][0]['height']
     return width, height
 
+def get_folder_size(path):
+    total_size = 0
+    for dirpath, dirnames, filenames in os.walk(path):
+        for f in filenames:
+            fp = os.path.join(dirpath, f)
+            if os.path.exists(fp):
+                total_size += os.path.getsize(fp)
+    return total_size
 
-# Utility: allowed cores list (skip core 0 by default)
-def get_allowed_cores(num_cores, skip_core0=True):
-    cores = list(range(psutil.cpu_count(logical=True)))
-    if skip_core0 and 0 in cores:
-        cores.remove(0)
-    return cores[:num_cores]
+# METHODS
 
-
-# The main mp4->frames function, now using producer Pool + single GPU consumer
+# The main mp4 -> ccframes
 def mp4_to_frames(input_path, targetFPS, total_res):
     global frameCalcStart
 
@@ -361,8 +394,8 @@ def mp4_to_frames(input_path, targetFPS, total_res):
         shutil.rmtree(output_dir)
     os.makedirs(output_dir, exist_ok=True)
 
-    width, height = get_video_resolution(input_path)
-    calc_width, calc_height = 0, 0
+    width,height = get_video_resolution(input_path)
+    calc_width, calc_height = 0,0
     target_aspect = aspect[0] / aspect[1]
     image_aspect = (width * 1.5) / height
 
@@ -372,11 +405,11 @@ def mp4_to_frames(input_path, targetFPS, total_res):
     else:
         calc_height = total_res[1]
         calc_width = total_res[1] * image_aspect
-
+    
     calc = (math.floor(calc_width), math.floor(calc_height))
-    print("Calculated resolution to match aspect ratio:", calc)
-    calc = (calc[0] // 2 * 2, calc[1] // 2 * 2)
-    print("Rescaling to:", calc)
+    print("Calculated resolution to match aspect ratio:",calc)
+    calc = (calc[0]// 2 * 2, calc[1]// 2 * 2)
+    print("Rescaling to:",calc)
 
     current_fps = get_fps(input_path)
     targetFPS = min(current_fps, targetFPS)
@@ -428,7 +461,7 @@ def mp4_to_frames(input_path, targetFPS, total_res):
     listener_t.start()
 
     # start gpu consumer process (single process that owns CUDA)
-    gpu_proc = mp.Process(target=gpu_consumer, args=(frame_queue, output_dir, total_res, aspect, False, status_queue))
+    gpu_proc = mp.Process(target=gpu_consumer, args=(frame_queue, output_dir, total_res, aspect, not careAboutExtraEdgePixels, status_queue))
     gpu_proc.start()
 
     try:
@@ -480,27 +513,7 @@ def mp4_to_frames(input_path, targetFPS, total_res):
 
     torch.cuda.empty_cache()
 
-
-def is_image_file(filepath):
-    exclude_formats = ["GIF"]
-    try:
-        with Image.open(filepath) as img:
-            img.verify()
-            if img.format.lower() in [fmt.lower() for fmt in exclude_formats]:
-                return False
-        return True
-    except Exception:
-        return False
-
-
-def is_gif(filepath):
-    try:
-        with Image.open(filepath) as img:
-            return img.format == "GIF"
-    except Exception:
-        return False
-
-
+#NOTE IMPLEMENT MULTITHREADING
 def gif_to_frames(input_path, total_res):
     output_dir = re.sub(r'[^a-zA-Z0-9]', '', os.path.basename(input_path).split('.')[0]).upper()
     print("Working Dir", output_dir)
@@ -523,27 +536,12 @@ def gif_to_frames(input_path, total_res):
                 print(f"Processing frame {frame_number + 1} / {frame_count}", end='\r', flush=True)
 
 
-def is_video_file(filepath):
-    video_extensions = [".mp4", ".avi", ".mov", ".mkv"]
-    ext = os.path.splitext(filepath)[1].lower()
-    return ext in video_extensions
-
-
-def get_folder_size(path):
-    total_size = 0
-    for dirpath, dirnames, filenames in os.walk(path):
-        for f in filenames:
-            fp = os.path.join(dirpath, f)
-            if os.path.exists(fp):
-                total_size += os.path.getsize(fp)
-    return total_size
-
+# MAIN THREAD
 
 def main(input_path, totalMonitors, aspect_arg, scale, targetFPS):
     global aspect
     aspect = aspect_arg
-    total_res = (math.floor((round(21.33266129032258 * (totalMonitors[0] / aspect[0]) - 6.645161290322656) * aspect[0]) / (scale * 2)),
-                 math.floor((round(14.222324046920821 * (totalMonitors[1] / aspect[1]) - 4.449596774193615) * aspect[1]) / (scale * 2)))
+    total_res = (math.floor((round(21.33266129032258 * (totalMonitors[0]/aspect[0]) - 6.645161290322656)*aspect[0])/(scale*2)), math.floor((round(14.222324046920821 * (totalMonitors[1]/aspect[1]) - 4.449596774193615)*aspect[1])/(scale*2)))
     print("In game resolution to match:", total_res)
 
     if is_image_file(input_path):
@@ -560,7 +558,6 @@ def main(input_path, totalMonitors, aspect_arg, scale, targetFPS):
 
     output_dir = re.sub(r'[^a-zA-Z0-9]', '', os.path.basename(input_path).split('.')[0]).upper()
     print(f"Final size: {get_folder_size(output_dir) / (1024 * 1024):.2f} MB")
-
 
 if __name__ == "__main__":
     # spawn start method (keeps behavior consistent on Windows / Unix)
