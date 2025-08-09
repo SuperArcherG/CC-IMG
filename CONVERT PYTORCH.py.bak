@@ -1,13 +1,9 @@
-# Revised CONVERT.py — single-GPU-consumer with CPU producers and batching
 from PIL import Image
 from multiprocessing import Pool, cpu_count
 import multiprocessing as mp
-import sys, os, math, torch, time, cv2, ffmpeg, json, subprocess, numpy as np, re, shutil, gc
-import psutil
-import threading
-import cv2
+import sys, os, math, torch, time, cv2, ffmpeg, json, subprocess, numpy as np, re, shutil, gc, psutil, threading, cv2, kornia
+import cProfile
 from skimage.color import rgb2lab
-import kornia
 
 # Ensure environment variables for thread control before Pools are created
 os.environ.setdefault('OMP_NUM_THREADS', '1')
@@ -17,16 +13,15 @@ try:
 except Exception:
     pass
 
-# TIME TO BEAT 276
 start = time.time()
 frameCalcStart = 0
 
-# # # PERFORMANCE SETTINGS (tweakable)
-poolSize = 12                 # number of CPU producers (workers)
+# # # PERFORMANCE SETTINGS
+poolSize = 12
 OverideQueueSize = False
 queueSize = 1
-careAboutExtraEdgePixels = True
-profile = True
+careAboutExtraEdgePixels = False
+profile = False
 displayProgress = True
 legacyGPUSupport = False
 dither = True
@@ -50,27 +45,24 @@ cc_palette = {
     16384: (204, 76, 76),    # Red         #CC4C4C
     32768: (17, 17, 17),     # Black       #111111
 }
-
-
-# Globals for device/palette (will be reinitialized in GPU consumer process)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-if not torch.cuda.is_available():
-    print("\033[91mWARNING: CUDA not available. Running on CPU. This will be slow.\033[0m")
-
-cc_palette_keys = torch.tensor(list(cc_palette.keys()))
-cc_palette_colors = torch.tensor(list(cc_palette.values()), dtype=torch.float32) / 255.0
-
-# build sRGB palette (0..1)
-palette_srgb = torch.tensor(list(cc_palette.values()), dtype=torch.float32, device=device).div_(255.0)  # (P,3)
-
-# convert palette to kornia-friendly format: (1,3,P,1) -> rgb_to_lab -> (1,3,P,1) -> (P,3)
-# This keeps conversion identical to kornia's frame conversion
-pal = palette_srgb.clone().permute(1, 0).unsqueeze(0).unsqueeze(-1)   # (1, 3, P, 1)
-pal_lab = kornia.color.rgb_to_lab(pal)                                # (1, 3, P, 1)
-palette_lab = pal_lab.permute(0, 2, 3, 1).reshape(-1, 3).to(device)    # (P,3) Lab on device
-
-# keep palette_keys for final mapping (on device)
-palette_keys = cc_palette_keys.to(device)
+hex_map = {
+    1:    "0",  # white
+    2:    "1",  # orange
+    4:    "2",  # magenta
+    8:    "3",  # lightBlue
+    16:   "4",  # yellow
+    32:   "5",  # lime
+    64:   "6",  # pink
+    128:  "7",  # gray
+    256:  "8",  # lightGray
+    512:  "9",  # cyan
+    1024: "a",  # purple
+    2048: "b",  # blue
+    4096: "c",  # brown
+    8192: "d",  # green
+    16384:"e",  # red
+    32768:"f",  # black
+}
 
 # utility: pin workers to allowed cores (caller passes list of cores)
 def init_worker(cores):
@@ -98,7 +90,24 @@ def cpu_preprocess_task(item):
     return (idx, frame_rgb)
 
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if not torch.cuda.is_available():
+    print("\033[91mWARNING: Python Version Mismatch or Not Installed Properly. Use python 3.11!\033[0m")
 
+cc_palette_keys = torch.tensor(list(cc_palette.keys()))
+cc_palette_colors = torch.tensor(list(cc_palette.values()), dtype=torch.float32) / 255.0
+
+# build sRGB palette (0..1)
+palette_srgb = torch.tensor(list(cc_palette.values()), dtype=torch.float32, device=device).div_(255.0)  # (P,3)
+
+# convert palette to kornia-friendly format: (1,3,P,1) -> rgb_to_lab -> (1,3,P,1) -> (P,3)
+# This keeps conversion identical to kornia's frame conversion
+pal = palette_srgb.clone().permute(1, 0).unsqueeze(0).unsqueeze(-1)   # (1, 3, P, 1)
+pal_lab = kornia.color.rgb_to_lab(pal)                                # (1, 3, P, 1)
+palette_lab = pal_lab.permute(0, 2, 3, 1).reshape(-1, 3).to(device)    # (P,3) Lab on device
+
+# keep palette_keys for final mapping (on device)
+palette_keys = cc_palette_keys.to(device)
 
 #Raw image to cc color aproximation with no dithering
 @torch.no_grad()
@@ -177,78 +186,6 @@ def closest_cc_dither(image_array):
     out_keys = palette_keys[final_idxs]
     return out_keys.cpu().numpy()
 
-
-
-
-# Convert image -> ccframe
-def convert_image_to_ccframe(input_path="", img=None, ccframe_path="", total_res=(-1, -1), aspect=(-1, -1), precalc=False):
-    if img is None:
-        print("Loading image:", input_path)
-        img = Image.open(input_path).convert("RGB")
-        if ccframe_path == "":
-            parts = input_path.split(".")
-            parts.pop()
-            new_filename = ".".join(parts) + ".bmp"
-            ccframe_path = ".".join(parts) + ".ccframe"
-            ccframe_path = new_filename
-
-    if not precalc:
-        width, height = img.size
-        calc_width, calc_height = 0, 0
-        target_aspect = aspect[0] / aspect[1]
-        image_aspect = (width * 1.5) / height
-
-        if image_aspect > target_aspect:
-            calc_width = total_res[0]
-            calc_height = total_res[0] / image_aspect
-        else:
-            calc_height = total_res[1]
-            calc_width = total_res[1] * image_aspect
-
-        calc = (math.floor(calc_width), math.floor(calc_height))
-        img = img.resize(calc, Image.Resampling.NEAREST)
-
-    np_img = np.array(img)
-
-    if dither:
-        cc_matrix = closest_cc_dither(np_img)
-    else:
-        cc_matrix = closest_cc(np_img)
-
-    hex_map = {
-        1:    "0",  # white
-        2:    "1",  # orange
-        4:    "2",  # magenta
-        8:    "3",  # lightBlue
-        16:   "4",  # yellow
-        32:   "5",  # lime
-        64:   "6",  # pink
-        128:  "7",  # gray
-        256:  "8",  # lightGray
-        512:  "9",  # cyan
-        1024: "a",  # purple
-        2048: "b",  # blue
-        4096: "c",  # brown
-        8192: "d",  # green
-        16384:"e",  # red
-        32768:"f",  # black
-    }
-
-    lookup = np.full(32769, ord("f"), dtype=np.uint8)
-    for k, v in hex_map.items():
-        lookup[k] = ord(v)
-
-    lua_lines = ["return {"]
-    for row in cc_matrix:
-        bg_line = bytes(lookup[row]).decode("ascii")
-        text_line = " " * len(bg_line)
-        text_color_line = "0" * len(bg_line)
-        lua_lines.append(f'  {{"{text_line}", "{text_color_line}", "{bg_line}"}},')
-    lua_lines.append("}")
-
-    with open(ccframe_path, "w") as f:
-        f.write("\n".join(lua_lines))
-
 # GPU consumer — owns CUDA, batches frames from frame_queue, dithers & writes files
 def gpu_consumer(frame_queue: mp.Queue, output_dir: str, total_res, aspect, precalc_flag, status_queue: mp.Queue = None):
     # initialize CUDA and move palette/keys to device here (only this process uses CUDA)
@@ -280,7 +217,7 @@ def gpu_consumer(frame_queue: mp.Queue, output_dir: str, total_res, aspect, prec
             try:
                 out_path = os.path.join(output_dir, f"frame_{idx:03}.ccframe")
                 pil_img = Image.fromarray(frame_rgb)
-                convert_image_to_ccframe(img=pil_img, ccframe_path=out_path, total_res=total_res, aspect=aspect, precalc=precalc_flag)
+                convert_image_to_ccframe(img=pil_img, output_path=out_path, total_res=total_res, aspect=aspect, precalc=precalc_flag)
                 if status_queue is not None:
                     status_queue.put(('finished', idx))
             except Exception as e:
@@ -290,8 +227,9 @@ def gpu_consumer(frame_queue: mp.Queue, output_dir: str, total_res, aspect, prec
                 else:
                     print("GPU consumer error:", e)
 
-# listener thread — centralizes prints in the main process
+# listener thread which allows subproccesses to print to the command line
 def status_listener(status_queue: mp.Queue, total_frames: int, displayProgress: bool = True):
+    last_loaded = -1
     while True:
         msg = status_queue.get()
         if msg is None:
@@ -304,46 +242,24 @@ def status_listener(status_queue: mp.Queue, total_frames: int, displayProgress: 
         elif typ == 'loaded':
             idx = payload
             # reduce print frequency for loaded messages
-            print(f"Loading frame into memory {idx + 1} / {total_frames}\033[K", end='\r', flush=True)
+            if displayProgress and (idx % 10 == 0):
+                print(f"Loading frame into memory {idx + 1} / {total_frames}\033[K", end='\r', flush=True)
         elif typ == 'error':
             print("Worker error:", payload)
 
-
-
+# Create a lookup table mapping ComputerCraft color keys to their hex digit (in ASCII)
+lookup = np.full(32769, ord("f"), dtype=np.uint8)  
+for k, v in hex_map.items(): 
+    lookup[k] = ord(v)
 
 # QUERIES
-
-def get_allowed_cores(num_cores, skip_core0=True):
-    cores = list(range(psutil.cpu_count(logical=True)))
-    if skip_core0 and 0 in cores:
-        cores.remove(0)
-    return cores[:num_cores]
-
 def is_video_file(filepath):
     video_extensions = [".mp4", ".avi", ".mov", ".mkv"]
     ext = os.path.splitext(filepath)[1].lower()
     return ext in video_extensions
-
-def is_image_file(filepath):
-    try:
-        with Image.open(filepath) as img:
-            img.verify()
-            if is_gif(filepath):
-                return False
-        return True
-    except Exception:
-        return False
-
-def is_gif(filepath):
-    try:
-        with Image.open(filepath) as img:
-            return img.format.upper() == "GIF"
-    except Exception:
-        return False
-
 def get_fps(path):
     cmd = [
-        'ffprobe', '-v', 'error',
+        'ffprobe', '-v', 'error', 
         '-select_streams', 'v:0',
         '-show_entries', 'stream=r_frame_rate',
         '-of', 'json',
@@ -352,11 +268,11 @@ def get_fps(path):
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"ffprobe error: {result.stderr}")
+    
     info = json.loads(result.stdout)
     r_frame_rate = info['streams'][0]['r_frame_rate']  # like '30000/1001'
     num, den = map(int, r_frame_rate.split('/'))
     return num / den
-
 def get_video_resolution(path):
     cmd = [
         'ffprobe', '-v', 'error',
@@ -368,32 +284,103 @@ def get_video_resolution(path):
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"ffprobe error: {result.stderr}")
+    
     info = json.loads(result.stdout)
     width = info['streams'][0]['width']
     height = info['streams'][0]['height']
     return width, height
-
+def is_image_file(filepath):
+    exclude_formats = ["GIF"]
+    try:
+        with Image.open(filepath) as img:
+            img.verify()
+            if img.format.lower() in [fmt.lower() for fmt in exclude_formats]:
+                return False
+        return True
+    except Exception:
+        return False
+def is_gif(filepath):
+    try:
+        with Image.open(filepath) as img:
+            return img.format == "GIF"
+    except Exception:
+        return False
+def get_allowed_cores(num_cores, skip_core0=True):
+    cores = list(range(psutil.cpu_count(logical=True)))
+    if skip_core0 and 0 in cores:
+        cores.remove(0)
+    return cores[:num_cores]
 def get_folder_size(path):
     total_size = 0
     for dirpath, dirnames, filenames in os.walk(path):
         for f in filenames:
             fp = os.path.join(dirpath, f)
-            if os.path.exists(fp):
+            if os.path.exists(fp):  # Ensure file still exists
                 total_size += os.path.getsize(fp)
     return total_size
 
-# METHODS
+# Image Array to CCFRAME w/o return, is called by mp4 and gif to frames for individual frame handling
+def convert_image_to_ccframe(input_path="", img = None, output_path="", total_res=(-1,-1), aspect=(-1,-1), precalc = False):
+    ccname = ""
+    if img == None:
+        print("Loading image:",input_path)
+        img = Image.open(input_path).convert("RGB")
+        if output_path == "":
+            parts = input_path.split(".")
+            parts.pop()
+            new_filename = ".".join(parts) + ".bmp"
+            ccname = ".".join(parts) + ".ccframe"
+            output_path = new_filename
+    else:
+        ccname = output_path
 
-# The main mp4 -> ccframes
-def mp4_to_frames(input_path, targetFPS, total_res):
-    global frameCalcStart
+    if not precalc:
+        width, height = img.size
+        calc_width, calc_height = 0,0
+        target_aspect = aspect[0] / aspect[1]
+        image_aspect = (width * 1.5) / height
+
+        if image_aspect > target_aspect:
+            calc_width = total_res[0]
+            calc_height = total_res[0] / image_aspect
+        else:
+            calc_height = total_res[1]
+            calc_width = total_res[1] * image_aspect
+        
+        calc = (math.floor(calc_width),math.floor(calc_height))
+        img = img.resize(calc, Image.Resampling.NEAREST)
+
+
+    np_img = np.array(img)
+
+    if dither:
+        cc_matrix = closest_cc_dither(np_img)
+    else:
+        cc_matrix = closest_cc(np_img)
+
+    lua_lines = ["return {"]
+
+    for row in cc_matrix:
+        bg_line = bytes(lookup[row]).decode("ascii")
+        text_line = " " * len(bg_line)
+        text_color_line = "0" * len(bg_line)
+        lua_lines.append(f'  {{"{text_line}", "{text_color_line}", "{bg_line}"}},')
+
+    lua_lines.append("}")
+
+    with open(ccname, "w") as f:
+        f.write("\n".join(lua_lines))
+
+# Video to CCFRAME
+def mp4_to_frames(input_path,targetFPS,total_res):
+    
+    input_path = input_path
 
     output_dir = re.sub(r'[^a-zA-Z0-9]', '', os.path.basename(input_path).split('.')[0]).upper()
-    print("Working Dir", output_dir)
+    print("Working Dir",output_dir)
     if os.path.exists(output_dir) and os.path.isdir(output_dir):
         shutil.rmtree(output_dir)
     os.makedirs(output_dir, exist_ok=True)
-
     width,height = get_video_resolution(input_path)
     calc_width, calc_height = 0,0
     target_aspect = aspect[0] / aspect[1]
@@ -412,10 +399,10 @@ def mp4_to_frames(input_path, targetFPS, total_res):
     print("Rescaling to:",calc)
 
     current_fps = get_fps(input_path)
-    targetFPS = min(current_fps, targetFPS)
-    print(f"Resampling {current_fps} to {targetFPS} FPS")
+    targetFPS = min(current_fps,targetFPS)
 
-    # use ffmpeg to produce a temporally-resampled and scaled temp clip (same as your previous logic)
+    print(f"Resampling {current_fps} to {targetFPS} FPS") 
+
     if not legacyGPUSupport:
         (
             ffmpeg
@@ -428,7 +415,7 @@ def mp4_to_frames(input_path, targetFPS, total_res):
         )
     else:
         (
-            ffmpeg
+        ffmpeg
             .input(input_path, hwaccel='cuda', hwaccel_device=0)
             .filter('fps', fps=targetFPS, round='up')
             .filter('scale', width=calc[0], height=calc[1])
@@ -436,16 +423,20 @@ def mp4_to_frames(input_path, targetFPS, total_res):
             .global_args('-loglevel', 'error')
             .run(overwrite_output=True)
         )
+    
+    input_path = output_dir + "/TMP.mp4"
 
-    tmp_path = output_dir + "/TMP.mp4"
-    cap = cv2.VideoCapture(tmp_path)
+
+    cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
         print("Error: Could not open video file.")
         return
-
+    
     frame_number = 0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     maxCache = queueSize if OverideQueueSize else total_frames
+    global frameCalcStart
+
     frameCalcStart = time.time()
 
     # Prepare multiprocessing pool (CPU producers)
@@ -461,9 +452,11 @@ def mp4_to_frames(input_path, targetFPS, total_res):
     listener_t.start()
 
     # start gpu consumer process (single process that owns CUDA)
-    gpu_proc = mp.Process(target=gpu_consumer, args=(frame_queue, output_dir, total_res, aspect, not careAboutExtraEdgePixels, status_queue))
+    gpu_proc = mp.Process(target=gpu_consumer, args=(frame_queue, output_dir, total_res, aspect, True, status_queue))
     gpu_proc.start()
 
+    # Prepare multiprocessing pool
+    allowed_cores = get_allowed_cores(poolSize, skip_core0=True)
     try:
         while True:
             frames_batch = []
@@ -507,16 +500,23 @@ def mp4_to_frames(input_path, targetFPS, total_res):
 
         # cleanup
         try:
-            os.remove(tmp_path)
+            os.remove(input_path)
         except OSError:
             pass
 
     torch.cuda.empty_cache()
 
-#NOTE IMPLEMENT MULTITHREADING
-def gif_to_frames(input_path, total_res):
+    cap.release()
+
+    try:
+        os.remove(input_path)
+    except OSError:
+        pass
+
+# Gif to frames
+def gif_to_frames(input_path,total_res):
     output_dir = re.sub(r'[^a-zA-Z0-9]', '', os.path.basename(input_path).split('.')[0]).upper()
-    print("Working Dir", output_dir)
+    print("Working Dir",output_dir)
     os.makedirs(output_dir, exist_ok=True)
 
     with Image.open(input_path) as img:
@@ -526,30 +526,25 @@ def gif_to_frames(input_path, total_res):
         for frame_number in range(frame_count):
             img.seek(frame_number)
             frame = img.copy()
-            duration = img.info.get("duration", 50)
+            duration = img.info.get("duration",50)
 
             if frame.mode != "RGB":
                 frame = frame.convert("RGB")
             frame_path = os.path.join(output_dir, f"frame_{frame_number:03}_{duration:2}.ccframe")
-            convert_image_to_ccframe(img=frame, output_path=frame_path, total_res=total_res)
-            if displayProgress and frame_number % 20 == 0:
-                print(f"Processing frame {frame_number + 1} / {frame_count}", end='\r', flush=True)
+            convert_image_to_ccframe(img = frame,output_path=frame_path,total_res=total_res)
+            print(f"Processing frame {frame_number + 1} / {frame_count}", end='\r', flush=True)
 
-
-# MAIN THREAD
-
-def main(input_path, totalMonitors, aspect_arg, scale, targetFPS):
-    global aspect
-    aspect = aspect_arg
+# Main Function
+def main(input_path,totalMonitors,aspect,scale,targetFPS):
     total_res = (math.floor((round(21.33266129032258 * (totalMonitors[0]/aspect[0]) - 6.645161290322656)*aspect[0])/(scale*2)), math.floor((round(14.222324046920821 * (totalMonitors[1]/aspect[1]) - 4.449596774193615)*aspect[1])/(scale*2)))
     print("In game resolution to match:", total_res)
 
     if is_image_file(input_path):
-        convert_image_to_ccframe(input_path=input_path, total_res=total_res)
+        convert_image_to_ccframe(input_path=input_path,total_res=total_res)
     elif is_gif(input_path):
-        gif_to_frames(input_path, total_res)
+        gif_to_frames(input_path,total_res)
     elif is_video_file(input_path):
-        mp4_to_frames(input_path, targetFPS, total_res)
+        mp4_to_frames(input_path,targetFPS,total_res)
     else:
         print("Unsupported file type.")
     end = time.time()
@@ -557,29 +552,38 @@ def main(input_path, totalMonitors, aspect_arg, scale, targetFPS):
     print(f"Time for frames: {end - frameCalcStart:.2f} seconds")
 
     output_dir = re.sub(r'[^a-zA-Z0-9]', '', os.path.basename(input_path).split('.')[0]).upper()
-    print(f"Final size: {get_folder_size(output_dir) / (1024 * 1024):.2f} MB")
+    print(f"Final size: {get_folder_size(output_dir)/ (1024 * 1024):.2f} MB")
 
 if __name__ == "__main__":
-    # spawn start method (keeps behavior consistent on Windows / Unix)
     mp.set_start_method('spawn', force=True)
-    if len(sys.argv) < 7:
-        print("Usage: python convert.py <media_file (Any* Image / GIF / mp4, avi, mov, mkv)> <Block Width> <Block Height> <Cell # X> <Cell # Y> <Text Scale> <FPS <= 20 (Optional)>")
-        sys.exit(1)
+    with cProfile.Profile() as pr:
+        if len(sys.argv) < 7:
+            print("Usage: python convert.py <media_file (Any* Image / GIF / mp4, avi, mov, mkv)> <Block Width> <Block Height> <Cell # X> <Cell # Y> <Text Scale> <FPS <= 20 (Optional)>")
+            sys.exit(1)
 
-    input_file = sys.argv[1]
-    totalMonitors = (int(sys.argv[2]), int(sys.argv[3]))
-    aspect = (int(sys.argv[4]), int(sys.argv[5]))
-    scale = float(sys.argv[6])
+        input_file = sys.argv[1]
+        totalMonitors = (int(sys.argv[2]),int(sys.argv[3]))
+        aspect = (int(sys.argv[4]),int(sys.argv[5]))
+        scale = float(sys.argv[6])
 
-    if len(sys.argv) > 7:
-        if float(sys.argv[7]) > 20:
-            print("\033[91mREQUESTED FPS TOO HIGH, SETTING TO 20\033[0m")
-        targetFPS = min(float(sys.argv[7]), 20)
-    else:
-        targetFPS = 20
+        if len(sys.argv) > 7:
+            if float(sys.argv[7]) > 20:
+                print("\033[91mREQUESTED FPS TOO HIGH, SETTING TO 20\033[0m")
+            targetFPS = min(float(sys.argv[7]),20)
+        else:
+            targetFPS = 20
 
-    if not os.path.exists(input_file):
-        print(f"Error: file not found: {input_file}")
-        sys.exit(1)
+        if not os.path.exists(input_file):
+            print(f"Error: file not found: {input_file}")
+            sys.exit(1)
+        
+        if profile:
+            pr = cProfile.Profile()
+            pr.enable()
 
-    main(input_file, totalMonitors, aspect, scale, targetFPS)
+            cProfile.run('main(input_file,totalMonitors,aspect,scale,targetFPS)', 'profile_data.prof')
+
+            pr.disable()
+            pr.dump_stats('profile_data.prof')
+        else:
+            main(input_file,totalMonitors,aspect,scale,targetFPS)
