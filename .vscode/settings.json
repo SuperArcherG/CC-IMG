@@ -5,5 +5,6 @@
         "textutils",
         "peripheral",
         "fs"
-    ]
+    ],
+    "python.REPL.enableREPLSmartSend": false
 }

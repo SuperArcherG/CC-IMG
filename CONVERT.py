@@ -8,14 +8,11 @@ from operator import itemgetter
 import cupy as cp
 from textwrap import dedent
 from math import ceil
+import numba as nb
 
 # Ensure environment variables for thread control before Pools are created
 os.environ.setdefault('OMP_NUM_THREADS', '1')
 os.environ.setdefault('MKL_NUM_THREADS', '1')
-# try:
-#     torch.set_num_threads(1)
-# except Exception:
-#     pass
 
 start = time.time()
 frameCalcStart = 0
@@ -28,7 +25,8 @@ careAboutExtraEdgePixels = True
 profile = False
 displayProgress = True
 legacyGPUSupport = False
-dither = True
+dither = False
+HQDither = False
 
 # Palette (official ComputerCraft default colors)
 cc_palette = {
@@ -83,26 +81,6 @@ def init_worker(cores):
     os.environ.setdefault('OMP_NUM_THREADS', '1')
     os.environ.setdefault('MKL_NUM_THREADS', '1')
 
-# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# if not torch.cuda.is_available():
-#     print("\033[91mWARNING: Python Version Mismatch or Not Installed Properly. Use python 3.11!\033[0m")
-
-# cc_palette_keys = torch.tensor(list(cc_palette.keys()))
-# cc_palette_colors = torch.tensor(list(cc_palette.values()), dtype=torch.float32) / 255.0
-
-# # build sRGB palette (0..1)
-# palette_srgb = torch.tensor(list(cc_palette.values()), dtype=torch.float32, device=device).div_(255.0)  # (P,3)
-
-# convert palette to kornia-friendly format: (1,3,P,1) -> rgb_to_lab -> (1,3,P,1) -> (P,3)
-# This keeps conversion identical to kornia's frame conversion
-# pal = palette_srgb.clone().permute(1, 0).unsqueeze(0).unsqueeze(-1)   # (1, 3, P, 1)
-# pal_lab = kornia.color.rgb_to_lab(pal)                                # (1, 3, P, 1)
-# palette_lab = pal_lab.permute(0, 2, 3, 1).reshape(-1, 3).to(device)    # (P,3) Lab on device
-
-# # keep palette_keys for final mapping (on device)
-# palette_keys = cc_palette_keys.to(device)
-
-
 # ---------- sRGB -> Lab (CuPy) ----------
 def rgb_to_lab_cp(rgb):
     rgb = cp.asarray(rgb, dtype=cp.float32)
@@ -144,13 +122,49 @@ def rgb_to_lab_cp(rgb):
     lab = cp.stack([L, a, b], axis=1)
     return lab.reshape(orig_shape)
 
+def rgb_to_lab_np(rgb):
+    if rgb.max() > 1.0:
+        rgb /= 255.0
+    orig_shape = rgb.shape
+    rgb = rgb.reshape(-1, 3)
+    mask = rgb <= 0.04045
+    rgb_lin = np.empty_like(rgb)
+    rgb_lin[mask] = rgb[mask] / 12.92
+    rgb_lin[~mask] = ((rgb[~mask] + 0.055) / 1.055) ** 2.4
 
+    M = np.array([[0.4124564, 0.3575761, 0.1804375],
+                  [0.2126729, 0.7151522, 0.0721750],
+                  [0.0193339, 0.1191920, 0.9503041]], dtype=np.float32)
+    xyz = rgb_lin @ M.T
+    xyz /= np.array([0.95047, 1.00000, 1.08883], dtype=np.float32)
+
+    epsilon = 0.008856
+    kappa = 903.3
+    mask = xyz > epsilon
+    f = np.empty_like(xyz)
+    f[mask] = np.cbrt(xyz[mask])
+    f[~mask] = (kappa * xyz[~mask] + 16.0) / 116.0
+
+    L = (116.0 * f[:, 1]) - 16.0
+    a = 500.0 * (f[:, 0] - f[:, 1])
+    b = 200.0 * (f[:, 1] - f[:, 2])
+    return np.stack([L, a, b], axis=1).reshape(orig_shape)
+
+# CPU versions of your color conversion (matches your GPU versions)
+def srgb_to_linear_np(srgb):
+    a = 0.055
+    return np.where(srgb <= 0.04045,
+                    srgb / 12.92,
+                    ((srgb + a) / (1 + a)) ** 2.4)
 
 def srgb_to_linear_cp(srgb):
     a = 0.055
     return cp.where(srgb <= 0.04045,
                     srgb / 12.92,
                     ((srgb + a) / (1 + a)) ** 2.4)
+
+
+
 
 # Convert palette to LAB with same pipeline as image
 palette_srgb = cp.array(list(cc_palette.values()), dtype=cp.float32) / 255.0
@@ -442,6 +456,129 @@ def closest_cc_dither(image_array, tile_size=32, use_fp16=False):
     cp.cuda.Stream.null.synchronize()
     return cp.asnumpy(keys_gpu)
 
+def closest_cc_dither_hq(image_array, use_fp16=False):
+    """
+    High-quality Floyd–Steinberg dithering using CuPy.
+    Processes the image strictly pixel-by-pixel (left-to-right, top-to-bottom)
+    with error diffusion.
+    """
+    # Prepare palette Lab on GPU
+    pal_vals = np.array(list(cc_palette.values()), dtype=np.float32) / 255.0
+    pal_gpu_srgb = cp.array(pal_vals, dtype=cp.float32)
+    pal_gpu_lab = rgb_to_lab_cp(pal_gpu_srgb[cp.newaxis, :, :]).reshape(-1, 3)  # (P,3)
+
+    # Prepare image Lab on GPU
+    if image_array.dtype == np.uint8:
+        img_gpu = cp.array(image_array, dtype=cp.float32) / 255.0
+    else:
+        img_gpu = cp.array(image_array, dtype=cp.float32)
+    img_lab = rgb_to_lab_cp(img_gpu)  # (H,W,3)
+
+    if use_fp16:
+        img_lab = img_lab.astype(cp.float16)
+        pal_gpu_lab = pal_gpu_lab.astype(cp.float16)
+
+    H, W, _ = img_lab.shape
+    out_idx = cp.empty((H, W), dtype=cp.int32)
+
+    # Process pixels in scanline order
+    for y in range(H):
+        for x in range(W):
+            pix = img_lab[y, x]
+            # Find nearest palette color
+            diffs = pal_gpu_lab - pix
+            dists = cp.sum(diffs * diffs, axis=1)
+            best_idx = int(cp.argmin(dists))
+            out_idx[y, x] = best_idx
+
+            chosen = pal_gpu_lab[best_idx]
+            err = pix - chosen
+
+            # Floyd–Steinberg diffusion
+            if x + 1 < W:
+                img_lab[y, x+1] += err * (7.0/16.0)
+            if y + 1 < H:
+                if x > 0:
+                    img_lab[y+1, x-1] += err * (3.0/16.0)
+                img_lab[y+1, x] += err * (5.0/16.0)
+                if x + 1 < W:
+                    img_lab[y+1, x+1] += err * (1.0/16.0)
+        print(f"Processing pixels {x+y*W} / {H*W}", end='\r', flush=True)
+
+
+    # Map palette indices to CC keys
+    palette_keys = np.array(list(cc_palette.keys()), dtype=np.int32)
+    keys_gpu = cp.array(palette_keys)[out_idx]
+    cp.cuda.Stream.null.synchronize()
+    return cp.asnumpy(keys_gpu)
+
+@nb.njit(cache=True, fastmath=True)
+def _fs_dither_lab(img_lab, palette_lab, palette_keys):
+    H, W, _ = img_lab.shape
+    P = palette_lab.shape[0]
+    out_keys = np.empty((H, W), dtype=np.int32)
+
+    for y in range(H):
+        for x in range(W):
+            # Find nearest palette color in Lab space
+            L, A, B = img_lab[y, x]
+            best_idx = 0
+            best_dist = 1e30
+            for pi in range(P):
+                dL = L - palette_lab[pi, 0]
+                dA = A - palette_lab[pi, 1]
+                dB = B - palette_lab[pi, 2]
+                dist = dL*dL + dA*dA + dB*dB
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx = pi
+
+            out_keys[y, x] = palette_keys[best_idx]
+
+            # Compute error
+            eL = L - palette_lab[best_idx, 0]
+            eA = A - palette_lab[best_idx, 1]
+            eB = B - palette_lab[best_idx, 2]
+
+            # Floyd–Steinberg error diffusion
+            if x + 1 < W:
+                img_lab[y, x+1, 0] += eL * (7/16)
+                img_lab[y, x+1, 1] += eA * (7/16)
+                img_lab[y, x+1, 2] += eB * (7/16)
+            if y + 1 < H and x > 0:
+                img_lab[y+1, x-1, 0] += eL * (3/16)
+                img_lab[y+1, x-1, 1] += eA * (3/16)
+                img_lab[y+1, x-1, 2] += eB * (3/16)
+            if y + 1 < H:
+                img_lab[y+1, x, 0] += eL * (5/16)
+                img_lab[y+1, x, 1] += eA * (5/16)
+                img_lab[y+1, x, 2] += eB * (5/16)
+            if y + 1 < H and x + 1 < W:
+                img_lab[y+1, x+1, 0] += eL * (1/16)
+                img_lab[y+1, x+1, 1] += eA * (1/16)
+                img_lab[y+1, x+1, 2] += eB * (1/16)
+
+    return out_keys
+
+def closest_cc_dither_hq_cpu(image_array):
+    """CPU Floyd–Steinberg dithering in Lab space."""
+    # Convert palette to LAB
+    pal_vals = np.array(list(cc_palette.values()), dtype=np.float32) / 255.0
+    pal_lin = srgb_to_linear_np(pal_vals)
+    pal_lab = rgb_to_lab_np(pal_lin)
+    palette_keys_arr = np.array(list(cc_palette.keys()), dtype=np.int32)
+
+    # Prepare image in LAB
+    img = image_array.astype(np.float32)
+    if img.max() > 1.0:
+        img /= 255.0
+    img_lin = srgb_to_linear_np(img)
+    img_lab = rgb_to_lab_np(img_lin)
+
+    # Run dithering
+    out_keys = _fs_dither_lab(img_lab.copy(), pal_lab, palette_keys_arr)
+    return out_keys
+
 # GPU consumer — owns CUDA, batches frames from frame_queue, dithers & writes files
 def gpu_consumer(frame_queue: mp.Queue, output_dir: str, target_res, precalc_flag, status_queue: mp.Queue = None):
     # initialize CUDA and move palette/keys to device here (only this process uses CUDA)
@@ -603,7 +740,10 @@ def convert_image_to_ccframe(input_path="", img = None, output_path="", target_r
     np_img = np.array(img)
 
     if dither:
-        cc_matrix = closest_cc_dither(np_img)
+        if HQDither:
+            cc_matrix = closest_cc_dither_hq_cpu(np_img)
+        else:
+            cc_matrix = closest_cc_dither(np_img)
     else:
         cc_matrix = closest_cc(np_img)
 
