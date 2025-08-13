@@ -1,3 +1,4 @@
+---@diagnostic disable: undefined-field, deprecated
 local args = { ... }
 local filename = args[1]
 local fps = tonumber(args[2]) or 20
@@ -10,9 +11,9 @@ if not filename then
     return
 end
 if fps < 1 then
-    delay = fps
+    Delay = fps
 else
-    delay = 1 / fps 
+    Delay = 1 / fps 
 end
 local isDir = fs.isDir(filename)
 local isFile = fs.exists(filename) and not isDir
@@ -138,97 +139,6 @@ local function loadColorFrame(path)
     end
 end
 
-
-local function base64_decode(data, yield_every)
-    local b='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
-    yield_every = yield_every or 32768
-
-    -- Chunked gsub to avoid "too long without yielding"
-    local cleaned = {}
-    local chunkSize = 50000
-    local pattern = '[^'..b..'=]'
-    local total_chunks = math.ceil(#data / chunkSize)
-
-    for chunk_i = 1, total_chunks do
-        local start_i = (chunk_i - 1) * chunkSize + 1
-        local chunk = data:sub(start_i, start_i + chunkSize - 1)
-        chunk = chunk:gsub(pattern, '')
-        cleaned[#cleaned+1] = chunk
-
-        local pct = math.floor((chunk_i / total_chunks) * 100)
-        printPercent("Base64 clean", pct)
-
-        os.queueEvent("")
-        os.pullEvent()
-    end
-    data = table.concat(cleaned)
-
-    -- Decode loop
-    local decoded = {}
-    local c = 0
-    local total = #data
-    for i=1, total, 4 do
-        local a = (b:find(data:sub(i,i), 1, true) or 1) - 1
-        local b1 = (b:find(data:sub(i+1,i+1), 1, true) or 1) - 1
-        local c1 = (b:find(data:sub(i+2,i+2), 1, true) or 1) - 1
-        local d = (b:find(data:sub(i+3,i+3), 1, true) or 1) - 1
-        local n = bit32.bor(
-            bit32.lshift(a, 18),
-            bit32.lshift(b1, 12),
-            bit32.lshift(c1, 6),
-            d
-        )
-        local x = string.char(
-            bit32.band(bit32.rshift(n, 16), 255),
-            bit32.band(bit32.rshift(n, 8), 255),
-            bit32.band(n, 255)
-        )
-        decoded[#decoded+1] = x
-        c = c + #x
-        if c >= yield_every then
-            local pct = math.floor((i / total) * 100)
-            printPercent("Base64 decode", pct)
-            os.queueEvent("")
-            os.pullEvent()
-            c = 0
-        end
-    end
-    return table.concat(decoded)
-end
-
--- Yield-safe zlib decompress using deflate.lua
-local function decompress_zlib(data, yield_every)
-    yield_every = yield_every or 32768
-    local deflate = require("deflate")
-    local output = {}
-    local counter = 0
-    local total = #data
-    local processed = 0
-
-    deflate.inflate_zlib{
-        input = data,
-        output = function(byte)
-            output[#output+1] = string.char(byte)
-            counter = counter + 1
-            processed = processed + 1
-            if counter >= yield_every then
-                local pct = math.floor((processed / total) * 100)
-                printPercent("Decompress", pct)
-                os.queueEvent("")
-                os.pullEvent()
-                counter = 0
-            end
-        end
-    }
-    return table.concat(output)
-end
-
-
-local isCCAnim = false
-if isFile and filename:match("%.ccanim$") then
-    isCCAnim = true
-end
-
 if isDir then
     local frameFiles = fs.list(filename)
     table.sort(frameFiles, function(a, b)
@@ -244,7 +154,7 @@ if isDir then
     for _, filename2 in ipairs(frameFiles) do
         if filename2:match("%.ccframe$") then
             local path = filename .. "/" .. filename2
-            print("Loading frame:", path)
+            printPercent("Loading frame", path)
             local frame = loadColorFrame(path)
             if frame then
                 table.insert(frames, frame)
@@ -260,8 +170,6 @@ if isDir then
             end
         end
     end
-
-
 
     local numFrames = #frames
     if numFrames == 0 then
@@ -283,8 +191,8 @@ if isDir then
             frame = nil
 
             local frameTime = os.clock() - startTime
-            if frameTime < delay then
-                os.sleep(delay - frameTime)
+            if frameTime < Delay then
+                os.sleep(Delay - frameTime)
             else
                 os.queueEvent("")
                 os.pullEvent()
@@ -292,54 +200,12 @@ if isDir then
 
             local frameTime = os.clock() - startTime
             term.redirect(term.native())
-            print(string.format("FPS = " .. math.floor((1/frameTime)*100+0.5)/100))
+            printPercent("FPS", math.floor((1/frameTime)*100+0.5)/100)
 
         end
     end
     -- local avg = totalTime / renderedFrames
     -- print(string.format("Average render time: %.4f seconds", avg))
-elseif isCCAnim then
-    local file = fs.open(filename, "r")
-    local b64data = file.readAll()
-    file.close()
-
-    local b64content = b64data:match('return%s+"(.*)"')
-    if not b64content then
-        error("Invalid .ccanim format (missing return string)")
-    end
-
-    -- Decode base64 in chunks
-    local compressed = base64_decode(b64content, 32768*2)
-    -- Decompress ZLIB data with yields
-    local lua_code = decompress_zlib(compressed, 32768*2)
-    if not lua_code then
-        error("Failed to decompress animation data")
-    end
-
-    -- Load Lua table
-    local func, err = load(lua_code, filename, "t", {})
-    if not func then
-        error("Failed to load animation: " .. tostring(err))
-    end
-    local animTable = func()
-    if type(animTable) ~= "table" or #animTable == 0 then
-        error("Animation file did not return a valid table")
-    end
-
-    -- Playback
-    while true do
-        for _, frame in ipairs(animTable) do
-            local startTime = os.clock()
-            renderFrame(frame)
-            local frameTime = os.clock() - startTime
-            if frameTime < delay then
-                os.sleep(delay - frameTime)
-            else
-                os.queueEvent("")
-                os.pullEvent()
-            end
-        end
-    end
 else
     local frame = loadColorFrame(filename)
     renderFrame(frame)

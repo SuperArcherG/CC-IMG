@@ -4,7 +4,8 @@
         "colors",
         "textutils",
         "peripheral",
-        "fs"
+        "fs",
+        "bit32"
     ],
     "python.REPL.enableREPLSmartSend": false
 }

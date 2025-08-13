@@ -179,15 +179,14 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
-porn.mp4
-HORSE.mp4
-WALL.MP4
-VRC.png
-KIWI.png
-PROTO.mp4
-KIWIANIM.gif
-BOAT.png
-Test Videos/KDA.mov
-HITLER.jpg
-WAH.JPG
-WT.mp4
+
+*.MP4
+*.gif
+*.png
+*.mov
+*.jpg
+*.JPG
+*.mp4
+*.ccframe
+
+TMP*
