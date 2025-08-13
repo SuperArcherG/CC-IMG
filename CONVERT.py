@@ -9,6 +9,9 @@ import cupy as cp
 from textwrap import dedent
 from math import ceil
 import numba as nb
+from multiprocessing import Manager
+import zlib, base64, textwrap
+
 
 # Ensure environment variables for thread control before Pools are created
 os.environ.setdefault('OMP_NUM_THREADS', '1')
@@ -26,7 +29,7 @@ profile = False
 displayProgress = True
 legacyGPUSupport = False
 dither = False
-HQDither = False
+HQDither = True
 
 # Palette (official ComputerCraft default colors)
 cc_palette = {
@@ -353,7 +356,6 @@ __global__ void tile_pass(
 
 _tile_kernel = cp.RawKernel(cuda_src, 'tile_pass')
 
-
 # ---------- Host wrapper ----------
 def closest_cc_dither(image_array, tile_size=32, use_fp16=False):
     """
@@ -457,11 +459,13 @@ def closest_cc_dither(image_array, tile_size=32, use_fp16=False):
     return cp.asnumpy(keys_gpu)
 
 def closest_cc_dither_hq(image_array, use_fp16=False):
+
     """
     High-quality Floyd–Steinberg dithering using CuPy.
     Processes the image strictly pixel-by-pixel (left-to-right, top-to-bottom)
     with error diffusion.
     """
+
     # Prepare palette Lab on GPU
     pal_vals = np.array(list(cc_palette.values()), dtype=np.float32) / 255.0
     pal_gpu_srgb = cp.array(pal_vals, dtype=cp.float32)
@@ -760,6 +764,29 @@ def convert_image_to_ccframe(input_path="", img = None, output_path="", target_r
     with open(ccname, "w") as f:
         f.write("\n".join(lua_lines))
 
+def convert_image_to_ccanim_frame(input_path="", img = None, output_path="", target_res=(-1,-1), pre_scaled = False):
+    if not pre_scaled:
+        img = img.resize(target_res, Image.Resampling.NEAREST)
+
+    np_img = np.array(img)
+
+    if dither:
+        if HQDither:
+            cc_matrix = closest_cc_dither_hq_cpu(np_img)
+        else:
+            cc_matrix = closest_cc_dither(np_img)
+    else:
+        cc_matrix = closest_cc(np_img)
+
+    lua_frame_lines = []
+    for row in cc_matrix:
+        bg_line = bytes(lookup[row]).decode("ascii")
+        text_line = " " * len(bg_line)
+        text_color_line = "0" * len(bg_line)
+        lua_frame_lines.append(f'{{"{text_line}", "{text_color_line}", "{bg_line}"}}')
+
+    return "{ " + ", ".join(lua_frame_lines) + " }"
+
 # Video to CCFRAME
 def mp4_to_frames(input_path,targetFPS,total_res):
     
@@ -890,6 +917,132 @@ def mp4_to_frames(input_path,targetFPS,total_res):
     except OSError:
         pass
 
+def gpu_consumer_collect(queue, target_res, status_queue, animation_frames):
+    while True:
+        item = queue.get()
+        if item is None:
+            break
+        idx, frame_rgb = item
+        lua_string = convert_image_to_ccanim_frame(img=Image.fromarray(frame_rgb), output_path="", target_res=target_res, pre_scaled=True)
+        animation_frames.append(lua_string)
+        status_queue.put(('finished', idx+1))
+
+def mp4_to_ccanim(input_path, targetFPS, total_res):
+    output_name = re.sub(r'[^a-zA-Z0-9]', '', os.path.basename(input_path).split('.')[0]).upper() + ".ccanim"
+    print("Output file:", output_name)
+
+    # Resample and scale via FFmpeg
+    width, height = get_video_resolution(input_path)
+    target_res = calculate_resolution((width, height), total_res)
+    current_fps = get_fps(input_path)
+    targetFPS = min(current_fps, targetFPS)
+
+    print(f"Resampling {current_fps} to {targetFPS} FPS") 
+
+    if not legacyGPUSupport:
+        (
+            ffmpeg
+            .input(input_path, hwaccel='cuda', hwaccel_device=0)
+            .filter('fps', fps=targetFPS, round='up')
+            .filter('scale', width=target_res[0], height=target_res[1])
+            .output("TMP.mp4", vcodec='h264_nvenc')
+            .global_args('-loglevel', 'error')
+            .run(overwrite_output=True)
+        )
+    else:
+        (
+            ffmpeg
+            .input(input_path, hwaccel='cuda', hwaccel_device=0)
+            .filter('fps', fps=targetFPS, round='up')
+            .filter('scale', width=target_res[0], height=target_res[1])
+            .output("TMP.mp4", vcodec='libx264')
+            .global_args('-loglevel', 'error')
+            .run(overwrite_output=True)
+        )
+
+    input_path = "TMP.mp4"
+
+    cap = cv2.VideoCapture(input_path)
+    if not cap.isOpened():
+        print("Error: Could not open video file.")
+        return
+
+    frame_number = 0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    maxCache = queueSize if OverideQueueSize else total_frames
+    global frameCalcStart
+
+    # Store final animation frames here
+    # animation_frames = []
+
+    # Prepare multiprocessing pool (CPU producers)
+    allowed_cores = get_allowed_cores(poolSize, skip_core0=True)
+    producer_pool = Pool(processes=len(allowed_cores), initializer=init_worker, initargs=(allowed_cores,))
+
+    # frame queue and status queue
+    frame_queue = mp.Queue(maxsize=max(64, 8 * len(allowed_cores)))
+    status_queue = mp.Queue()
+
+    # start status listener thread
+    listener_t = threading.Thread(target=status_listener, args=(status_queue, total_frames, displayProgress), daemon=True)
+    listener_t.start()
+
+    manager = Manager()
+    animation_frames = manager.list()
+
+    gpu_proc = mp.Process(target=gpu_consumer_collect, args=(frame_queue, target_res, status_queue, animation_frames))
+    gpu_proc.start()
+
+    try:
+        while True:
+            frames_batch = []
+            for _ in range(maxCache):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frames_batch.append((frame_number, frame_rgb))
+                print(f"Loading frame into memory {frame_number + 1} / {total_frames}\033[K", end='\r', flush=True)
+                frame_number += 1
+
+            if not frames_batch:
+                break
+
+            if frameCalcStart == 0:
+                frameCalcStart = time.time()
+
+            for result in producer_pool.imap_unordered(itemgetter(0, 1), frames_batch, chunksize=4):
+                frame_queue.put(result)
+
+            gc.collect()
+
+    finally:
+        producer_pool.close()
+        producer_pool.join()
+        frame_queue.put(None)
+        gpu_proc.join()
+        status_queue.put(None)
+        listener_t.join()
+        cap.release()
+
+        try:
+            os.remove(input_path)
+        except OSError:
+            pass
+    
+    print("Compressing and Saving. This can take a while!")
+
+    lua_data = "return {\n" + "".join(animation_frames) + "}\n"
+    compressed = zlib.compress(lua_data.encode("utf-8"), level=9)
+    b64 = base64.b64encode(compressed).decode("ascii")
+    wrapped = "\n".join(textwrap.wrap(b64, 200))
+
+    with open(output_name, 'w', encoding='utf-8') as f:
+        f.write(f'return "{wrapped}"\n')
+
+    print(f"Animation saved to {output_name}")
+
+
 # Gif to frames
 def gif_to_frames(input_path,total_res):
     output_dir = re.sub(r'[^a-zA-Z0-9]', '', os.path.basename(input_path).split('.')[0]).upper()
@@ -902,7 +1055,7 @@ def gif_to_frames(input_path,total_res):
         target_res = (0,0)
         for frame_number in range(frame_count):
             if frame_number == 0:
-                target_res = calculate_resolution(frame.size)
+                target_res = calculate_resolution(img.size,total_res)
             img.seek(frame_number)
             frame = img.copy()
             duration = img.info.get("duration",50)
@@ -924,7 +1077,7 @@ def main(input_path,totalMonitors,aspect,scale,targetFPS):
     elif is_gif(input_path):
         gif_to_frames(input_path,total_res)
     elif is_video_file(input_path):
-        mp4_to_frames(input_path,targetFPS,total_res)
+        mp4_to_ccanim(input_path,targetFPS,total_res)
     else:
         print("Unsupported file type.")
     end = time.time()

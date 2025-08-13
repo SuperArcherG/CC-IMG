@@ -82,6 +82,12 @@ local function renderFrame(frame)
     end
 end
 
+local function printPercent(label, pct)
+    local x, y = term.getCursorPos()
+    term.setCursorPos(1, y)         -- move to start of line
+    term.clearLine()                -- wipe current line
+    term.write(label .. ": " .. pct .. "%")
+end
 
 local function loadColorFrame(path)
     local file = fs.open(path, "r")
@@ -92,6 +98,78 @@ local function loadColorFrame(path)
     if ok and type(data) == "table" and data[1] then
         return data
     end
+end
+
+local function base64_decode(data, yield_every)
+    local b='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+    yield_every = yield_every or 32768
+    data = data:gsub('[^'..b..'=]', '')
+    local decoded = {}
+    local c = 0
+    local total = #data
+    for i=1, #data, 4 do
+        local a = (b:find(data:sub(i,i), 1, true) or 1) - 1
+        local b1 = (b:find(data:sub(i+1,i+1), 1, true) or 1) - 1
+        local c1 = (b:find(data:sub(i+2,i+2), 1, true) or 1) - 1
+        local d = (b:find(data:sub(i+3,i+3), 1, true) or 1) - 1
+        local n = bit32.bor(
+            bit32.lshift(a, 18),
+            bit32.lshift(b1, 12),
+            bit32.lshift(c1, 6),
+            d
+        )
+        local x = string.char(
+            bit32.band(bit32.rshift(n, 16), 255),
+            bit32.band(bit32.rshift(n, 8), 255),
+            bit32.band(n, 255)
+        )
+        decoded[#decoded+1] = x
+        c = c + #x
+        if c >= yield_every then
+            local pct = math.floor((i / total) * 100)
+            printPercent("Base64 decode", pct)
+            os.queueEvent("")
+            os.pullEvent()
+            c = 0
+        end
+    end
+    print("Base64 decode: 100%")
+    return table.concat(decoded)
+end
+
+-- Yield-safe zlib decompress using deflate.lua
+local function decompress_zlib(data, yield_every)
+    yield_every = yield_every or 32768
+    local deflate = require("deflate")
+    local output = {}
+    local counter = 0
+    local total = #data
+    local processed = 0
+
+    deflate.inflate_zlib{
+        input = data,
+        output = function(byte)
+            output[#output+1] = string.char(byte)
+            counter = counter + 1
+            processed = processed + 1
+            if counter >= yield_every then
+                local pct = math.floor((processed / total) * 100)
+                print("Decompress: " .. pct .. "%")
+                os.queueEvent("")
+                os.pullEvent()
+                counter = 0
+            end
+        end
+    }
+
+    print("Decompress: 100%")
+    return table.concat(output)
+end
+
+
+local isCCAnim = false
+if isFile and filename:match("%.ccanim$") then
+    isCCAnim = true
 end
 
 if isDir then
@@ -126,7 +204,7 @@ if isDir then
         end
     end
 
-    
+
 
     local numFrames = #frames
     if numFrames == 0 then
@@ -160,6 +238,48 @@ if isDir then
     end
     -- local avg = totalTime / renderedFrames
     -- print(string.format("Average render time: %.4f seconds", avg))
+elseif isCCAnim then
+    local file = fs.open(filename, "r")
+    local b64data = file.readAll()
+    file.close()
+
+    local b64content = b64data:match('return%s+"(.*)"')
+    if not b64content then
+        error("Invalid .ccanim format (missing return string)")
+    end
+
+    -- Decode base64 in chunks
+    local compressed = base64_decode(b64content, 32768)
+    -- Decompress ZLIB data with yields
+    local lua_code = decompress_zlib(compressed, 32768)
+    if not lua_code then
+        error("Failed to decompress animation data")
+    end
+
+    -- Load Lua table
+    local func, err = load(lua_code, filename, "t", {})
+    if not func then
+        error("Failed to load animation: " .. tostring(err))
+    end
+    local animTable = func()
+    if type(animTable) ~= "table" or #animTable == 0 then
+        error("Animation file did not return a valid table")
+    end
+
+    -- Playback
+    while true do
+        for _, frame in ipairs(animTable) do
+            local startTime = os.clock()
+            renderFrame(frame)
+            local frameTime = os.clock() - startTime
+            if frameTime < delay then
+                os.sleep(delay - frameTime)
+            else
+                os.queueEvent("")
+                os.pullEvent()
+            end
+        end
+    end
 else
     local frame = loadColorFrame(filename)
     renderFrame(frame)
