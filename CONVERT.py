@@ -10,8 +10,6 @@ from textwrap import dedent
 from math import ceil
 import numba as nb
 from multiprocessing import Manager
-import zlib, base64, textwrap
-
 
 # Ensure environment variables for thread control before Pools are created
 os.environ.setdefault('OMP_NUM_THREADS', '1')
@@ -32,8 +30,6 @@ legacyGPUSupport = False
 dither = True # GPU Based Tiled Dithering (Lowest Quality, Decent Speed)
 HQDither = True # CPU Based Horizontal + Vertical Dither (Medium Quality, Even Faster On Decent CPUs)
 UHQDither = True # True Floyd–Steinberg on GPU (Highest Quality, Slower)
-
-compressAnimation = True # VERY SLOW
 
 # Palette (official ComputerCraft default colors)
 cc_palette = {
