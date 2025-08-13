@@ -3,6 +3,8 @@ local filename = args[1]
 local fps = tonumber(args[2]) or 20
 local scale = tonumber(args[3]) or 0.5
 
+
+
 if not filename then
     print("Usage: script_name <filename.bmp> or <folder> <fps> <scale>")
     return
@@ -25,6 +27,20 @@ local monitors = {
     {peripheral.wrap("monitor_11"), peripheral.wrap("top"), peripheral.wrap("monitor_12")},
     {peripheral.wrap("monitor_13"), peripheral.wrap("monitor_14"), peripheral.wrap("monitor_16")}
 }
+
+local defaultMonText = {
+    {"","",""},
+    {"","",""},
+    {"","",""}
+}
+
+local defaultTextColor = {
+    {"","",""},
+    {"","",""},
+    {"","",""}
+}
+
+
 if not monitors or #monitors == 0 then error("No monitor(s) attached!") end
 
 for row, monitorGroup in ipairs(monitors) do
@@ -49,6 +65,28 @@ for i = 0, 15 do
     hexMap[2^i] = string.format("%x", i)
 end
 
+
+local function calculateDefaults(frame)
+    local frameHeight = #frame
+    local frameWidth = #frame[1][1]
+    for row, monitorGroup in ipairs(monitors) do -- Repeat for each row of monitors
+        local offY = math.floor(sh * (row - 1)) -- Calculate the offset in pixels for the current row
+        for column, monitor in ipairs(monitorGroup) do -- Repeat for each monitor in the row
+            local offX = math.floor(sw * (column - 1)) -- Calculate the offset in pixels for the current monitor            
+            local height = math.min(sh, #frame)
+            local line = frame[1 + offY]
+            if line then
+                local bgColor = unpack(line)
+                local sliceStart = offX + 1
+                local sliceEnd = offX + (frameWidth - offX)
+                local len = #(bgColor:sub(sliceStart, sliceEnd))
+                defaultMonText[row + 1][column + 1] = string.rep(" ",len)
+                defaultTextColor[row + 1][column + 1] = string.rep("0", len)
+            end
+        end
+    end
+end
+
 local function renderFrame(frame)
     local frameHeight = #frame
     local frameWidth = #frame[1][1]
@@ -63,16 +101,16 @@ local function renderFrame(frame)
             for y = 1, height do
                 local line = frame[y + offY]
                 if line then
-                    local text, textColor, bgColor = unpack(line)
+                    local bgColor = unpack(line)
 
                     local sliceStart = offX + 1
                     local sliceEnd = offX + (frameWidth - offX)
 
-                    if sliceEnd <= #text then
+                    if sliceEnd <= #bgColor then
                         term.setCursorPos(1, y)
                         term.blit(
-                            text:sub(sliceStart, sliceEnd),
-                            textColor:sub(sliceStart, sliceEnd),
+                            defaultMonText[row + 1][column + 1],
+                            defaultTextColor[row + 1][column + 1],
                             bgColor:sub(sliceStart, sliceEnd)
                         )
                     end
@@ -100,14 +138,36 @@ local function loadColorFrame(path)
     end
 end
 
+
 local function base64_decode(data, yield_every)
     local b='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
     yield_every = yield_every or 32768
-    data = data:gsub('[^'..b..'=]', '')
+
+    -- Chunked gsub to avoid "too long without yielding"
+    local cleaned = {}
+    local chunkSize = 50000
+    local pattern = '[^'..b..'=]'
+    local total_chunks = math.ceil(#data / chunkSize)
+
+    for chunk_i = 1, total_chunks do
+        local start_i = (chunk_i - 1) * chunkSize + 1
+        local chunk = data:sub(start_i, start_i + chunkSize - 1)
+        chunk = chunk:gsub(pattern, '')
+        cleaned[#cleaned+1] = chunk
+
+        local pct = math.floor((chunk_i / total_chunks) * 100)
+        printPercent("Base64 clean", pct)
+
+        os.queueEvent("")
+        os.pullEvent()
+    end
+    data = table.concat(cleaned)
+
+    -- Decode loop
     local decoded = {}
     local c = 0
     local total = #data
-    for i=1, #data, 4 do
+    for i=1, total, 4 do
         local a = (b:find(data:sub(i,i), 1, true) or 1) - 1
         local b1 = (b:find(data:sub(i+1,i+1), 1, true) or 1) - 1
         local c1 = (b:find(data:sub(i+2,i+2), 1, true) or 1) - 1
@@ -133,7 +193,6 @@ local function base64_decode(data, yield_every)
             c = 0
         end
     end
-    print("Base64 decode: 100%")
     return table.concat(decoded)
 end
 
@@ -154,15 +213,13 @@ local function decompress_zlib(data, yield_every)
             processed = processed + 1
             if counter >= yield_every then
                 local pct = math.floor((processed / total) * 100)
-                print("Decompress: " .. pct .. "%")
+                printPercent("Decompress", pct)
                 os.queueEvent("")
                 os.pullEvent()
                 counter = 0
             end
         end
     }
-
-    print("Decompress: 100%")
     return table.concat(output)
 end
 
@@ -213,11 +270,14 @@ if isDir then
 
     local totalTime = 0
     local renderedFrames = 0
-
+    local calculatedDefaults = false
     while true do
         for _, frame in ipairs(frames) do
             local startTime = os.clock()
             if frame then
+                if not calculatedDefaults then
+                    calculateDefaults(frame)
+                end
                 renderFrame(frame)
             end
             frame = nil
@@ -249,9 +309,9 @@ elseif isCCAnim then
     end
 
     -- Decode base64 in chunks
-    local compressed = base64_decode(b64content, 32768)
+    local compressed = base64_decode(b64content, 32768*2)
     -- Decompress ZLIB data with yields
-    local lua_code = decompress_zlib(compressed, 32768)
+    local lua_code = decompress_zlib(compressed, 32768*2)
     if not lua_code then
         error("Failed to decompress animation data")
     end

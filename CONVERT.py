@@ -28,8 +28,12 @@ careAboutExtraEdgePixels = True
 profile = False
 displayProgress = True
 legacyGPUSupport = False
-dither = False
-HQDither = True
+
+dither = True # GPU Based Tiled Dithering (Lowest Quality, Decent Speed)
+HQDither = True # CPU Based Horizontal + Vertical Dither (Medium Quality, Even Faster On Decent CPUs)
+UHQDither = True # True Floyd–Steinberg on GPU (Extremely Slow)
+
+compressAnimation = True # VERY SLOW
 
 # Palette (official ComputerCraft default colors)
 cc_palette = {
@@ -583,6 +587,133 @@ def closest_cc_dither_hq_cpu(image_array):
     out_keys = _fs_dither_lab(img_lab.copy(), pal_lab, palette_keys_arr)
     return out_keys
 
+# ---------- True Floyd–Steinberg on GPU (single-kernel, strict scan order) ----------
+
+_fs_true_src = r'''
+extern "C" __global__
+void fs_true(
+    float* img,          // Lab image flattened: H*W*3 (contiguous)
+    int H, int W,
+    const float* palette,// P*3 Lab
+    int P,
+    int* out_idx         // H*W palette indices
+){
+    // Enforce single-thread execution to maintain exact FS ordering.
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+
+    for (int y = 0; y < H; ++y){
+        for (int x = 0; x < W; ++x){
+            const int base = (y * W + x) * 3;
+            float L = img[base + 0];
+            float A = img[base + 1];
+            float B = img[base + 2];
+
+            // Nearest palette in Lab
+            int best = 0;
+            float bestd = 3.4e38f;
+            for (int pi = 0; pi < P; ++pi){
+                float dL = L - palette[pi*3 + 0];
+                float dA = A - palette[pi*3 + 1];
+                float dB = B - palette[pi*3 + 2];
+                float d  = dL*dL + dA*dA + dB*dB;
+                if (d < bestd){ bestd = d; best = pi; }
+            }
+
+            out_idx[y*W + x] = best;
+
+            // Error = original - chosen
+            const float c0 = palette[best*3 + 0];
+            const float c1 = palette[best*3 + 1];
+            const float c2 = palette[best*3 + 2];
+            const float e0 = L - c0;
+            const float e1 = A - c1;
+            const float e2 = B - c2;
+
+            // Floyd–Steinberg diffusion
+            // (x+1, y)   += err * 7/16
+            if (x + 1 < W){
+                int b1 = (y * W + (x+1)) * 3;
+                img[b1 + 0] += e0 * (7.0f/16.0f);
+                img[b1 + 1] += e1 * (7.0f/16.0f);
+                img[b1 + 2] += e2 * (7.0f/16.0f);
+            }
+            // (x-1, y+1) += err * 3/16
+            if (y + 1 < H && x - 1 >= 0){
+                int b2 = ((y+1) * W + (x-1)) * 3;
+                img[b2 + 0] += e0 * (3.0f/16.0f);
+                img[b2 + 1] += e1 * (3.0f/16.0f);
+                img[b2 + 2] += e2 * (3.0f/16.0f);
+            }
+            // (x,   y+1) += err * 5/16
+            if (y + 1 < H){
+                int b3 = ((y+1) * W + x) * 3;
+                img[b3 + 0] += e0 * (5.0f/16.0f);
+                img[b3 + 1] += e1 * (5.0f/16.0f);
+                img[b3 + 2] += e2 * (5.0f/16.0f);
+            }
+            // (x+1, y+1) += err * 1/16
+            if (y + 1 < H && x + 1 < W){
+                int b4 = ((y+1) * W + (x+1)) * 3;
+                img[b4 + 0] += e0 * (1.0f/16.0f);
+                img[b4 + 1] += e1 * (1.0f/16.0f);
+                img[b4 + 2] += e2 * (1.0f/16.0f);
+            }
+        }
+    }
+}
+''';
+
+_fs_true_kernel = cp.RawKernel(_fs_true_src, 'fs_true')
+
+def closest_cc_dither_uhq(image_array, use_fp16=False):
+    """
+    TRUE Floyd–Steinberg dithering:
+      - strict left-to-right, top-to-bottom scan
+      - error diffusion across the entire image (no tiles/passes)
+      - runs entirely in a single CUDA kernel to avoid Python loops
+
+    Returns: HxW numpy array of CC palette keys (ints).
+    """
+    # Palette → Lab (float32 on GPU)
+    pal_vals = np.array(list(cc_palette.values()), dtype=np.float32) / 255.0  # (P,3) sRGB
+    pal_gpu_srgb = cp.array(pal_vals, dtype=cp.float32)
+    pal_gpu_lab  = rgb_to_lab_cp(pal_gpu_srgb[cp.newaxis, :, :]).reshape(-1, 3)  # (P,3) Lab
+
+    # Image → Lab (float32 on GPU)
+    if image_array.dtype == np.uint8:
+        img_gpu = cp.array(image_array, dtype=cp.float32) / 255.0
+    else:
+        img_gpu = cp.array(image_array, dtype=cp.float32)
+    img_lab = rgb_to_lab_cp(img_gpu)  # (H,W,3)
+
+    # (Optional) fp16 storage, but kernel runs in fp32 for stability.
+    if use_fp16:
+        img_lab = img_lab.astype(cp.float16).astype(cp.float32)
+        pal_gpu_lab = pal_gpu_lab.astype(cp.float16).astype(cp.float32)
+
+    H, W, _ = img_lab.shape
+    P = pal_gpu_lab.shape[0]
+
+    # Flatten for kernel
+    img_flat = cp.ascontiguousarray(img_lab.ravel())
+    pal_flat = cp.ascontiguousarray(pal_gpu_lab.ravel())
+    out_idx  = cp.empty((H * W,), dtype=cp.int32)
+
+    # Launch single-threaded kernel (true serial FS in device code)
+    _fs_true_kernel(
+        (1,), (1,),
+        (img_flat, np.int32(H), np.int32(W),
+         pal_flat, np.int32(P),
+         out_idx)
+    )
+
+    # Map palette indices -> CC keys (ints) and return to CPU
+    palette_keys = np.array(list(cc_palette.keys()), dtype=np.int32)
+    keys_gpu = cp.array(palette_keys)[out_idx.reshape(H, W)]
+    cp.cuda.Stream.null.synchronize()
+    return cp.asnumpy(keys_gpu)
+
+
 # GPU consumer — owns CUDA, batches frames from frame_queue, dithers & writes files
 def gpu_consumer(frame_queue: mp.Queue, output_dir: str, target_res, precalc_flag, status_queue: mp.Queue = None):
     # initialize CUDA and move palette/keys to device here (only this process uses CUDA)
@@ -744,7 +875,9 @@ def convert_image_to_ccframe(input_path="", img = None, output_path="", target_r
     np_img = np.array(img)
 
     if dither:
-        if HQDither:
+        if UHQDither:
+            cc_matrix = closest_cc_dither_uhq(np_img)
+        elif HQDither:
             cc_matrix = closest_cc_dither_hq_cpu(np_img)
         else:
             cc_matrix = closest_cc_dither(np_img)
@@ -755,9 +888,7 @@ def convert_image_to_ccframe(input_path="", img = None, output_path="", target_r
 
     for row in cc_matrix:
         bg_line = bytes(lookup[row]).decode("ascii")
-        text_line = " " * len(bg_line)
-        text_color_line = "0" * len(bg_line)
-        lua_lines.append(f'  {{"{text_line}", "{text_color_line}", "{bg_line}"}},')
+        lua_lines.append(f'  {{"{bg_line}"}},')
 
     lua_lines.append("}")
 
@@ -771,7 +902,9 @@ def convert_image_to_ccanim_frame(input_path="", img = None, output_path="", tar
     np_img = np.array(img)
 
     if dither:
-        if HQDither:
+        if UHQDither:
+            cc_matrix = closest_cc_dither_uhq(np_img)
+        elif HQDither:
             cc_matrix = closest_cc_dither_hq_cpu(np_img)
         else:
             cc_matrix = closest_cc_dither(np_img)
@@ -781,9 +914,7 @@ def convert_image_to_ccanim_frame(input_path="", img = None, output_path="", tar
     lua_frame_lines = []
     for row in cc_matrix:
         bg_line = bytes(lookup[row]).decode("ascii")
-        text_line = " " * len(bg_line)
-        text_color_line = "0" * len(bg_line)
-        lua_frame_lines.append(f'{{"{text_line}", "{text_color_line}", "{bg_line}"}}')
+        lua_frame_lines.append(f'{{"{bg_line}"}}')
 
     return "{ " + ", ".join(lua_frame_lines) + " }"
 
@@ -1077,7 +1208,7 @@ def main(input_path,totalMonitors,aspect,scale,targetFPS):
     elif is_gif(input_path):
         gif_to_frames(input_path,total_res)
     elif is_video_file(input_path):
-        mp4_to_ccanim(input_path,targetFPS,total_res)
+        mp4_to_frames(input_path,targetFPS,total_res)
     else:
         print("Unsupported file type.")
     end = time.time()
